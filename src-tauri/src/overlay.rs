@@ -210,6 +210,16 @@ fn is_overlay(hwnd_val: isize) -> bool {
 }
 
 #[cfg(windows)]
+pub fn is_active() -> bool {
+    OVERLAY_ACTIVE.load(Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+pub fn is_skip_target(hwnd: HWND) -> bool {
+    should_skip_window(hwnd)
+}
+
+#[cfg(windows)]
 fn should_skip_window(hwnd: HWND) -> bool {
     unsafe {
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;

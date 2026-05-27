@@ -1,3 +1,4 @@
+mod click_guard;
 mod overlay;
 mod settings;
 mod shake;
@@ -115,6 +116,11 @@ pub fn run() {
 
             // Initialize overlay system
             overlay::init();
+
+            // Absorb the first "raise" click on background windows so
+            // accidental UI hits behind the blur don't fire.
+            #[cfg(windows)]
+            click_guard::init();
 
             // Start mouse shake detection in a background thread
             let shake_state = state.clone();
