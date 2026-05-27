@@ -1,0 +1,29 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Build output
+dist/
+build/
+
+# Logs
+*.log
+
+# Edit cruft
+*.tmp.*
+
+# Local Claude settings
+.claude/settings.local.json

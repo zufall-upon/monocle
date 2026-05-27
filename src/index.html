@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Monocle</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <div class="titlebar" data-tauri-drag-region>
+      <div class="titlebar-left">
+        <div class="logo">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <circle cx="12" cy="12" r="4"/>
+            <line x1="21.17" y1="8" x2="12" y2="8"/>
+            <line x1="3.95" y1="6.06" x2="8.54" y2="14"/>
+            <line x1="10.88" y1="21.94" x2="15.46" y2="14"/>
+          </svg>
+        </div>
+        <span class="titlebar-title">Monocle</span>
+      </div>
+      <button class="titlebar-close" id="btn-close">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+          <line x1="3" y1="3" x2="11" y2="11"/><line x1="11" y1="3" x2="3" y2="11"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="status-bar">
+      <div class="status-indicator" id="status-dot"></div>
+      <span class="status-text" id="status-text">Inactive</span>
+      <button class="toggle-btn" id="btn-toggle">
+        <span id="toggle-label">Activate</span>
+      </button>
+    </div>
+
+    <div class="hint">Shake your mouse to toggle</div>
+
+    <div class="controls">
+      <div class="control-group">
+        <label class="control-label">
+          <span>Dim</span>
+          <span class="control-value" id="val-tint-opacity">40%</span>
+        </label>
+        <input type="range" id="tint-opacity" min="0" max="100" value="40" />
+      </div>
+
+      <div class="control-group">
+        <label class="control-label">
+          <label class="checkbox-label compact">
+            <input type="checkbox" id="blur-enabled" checked />
+            <span class="checkmark"></span>
+            Blur
+          </label>
+          <span class="control-value" id="val-blur">60%</span>
+        </label>
+        <input type="range" id="blur-intensity" min="0" max="100" value="60" />
+      </div>
+
+      <div class="control-group">
+        <label class="control-label">
+          <span>Grain</span>
+          <span class="control-value" id="val-grain">30%</span>
+        </label>
+        <input type="range" id="grain-amount" min="0" max="100" value="30" />
+      </div>
+
+      <div class="control-group">
+        <label class="control-label">
+          <span>Shake sensitivity</span>
+          <span class="control-value" id="val-shake">50%</span>
+        </label>
+        <input type="range" id="shake-sensitivity" min="0" max="100" value="50" />
+      </div>
+
+      <div class="control-group color-group">
+        <label class="control-label">
+          <span>Tint color</span>
+        </label>
+        <div class="color-swatches">
+          <button class="swatch active" data-color="#000000" style="background:#000000"></button>
+          <button class="swatch" data-color="#0f172a" style="background:#0f172a"></button>
+          <button class="swatch" data-color="#1e1b4b" style="background:#1e1b4b"></button>
+          <button class="swatch" data-color="#172554" style="background:#172554"></button>
+          <button class="swatch" data-color="#14532d" style="background:#14532d"></button>
+          <button class="swatch" data-color="#422006" style="background:#422006"></button>
+          <input type="color" id="custom-color" value="#000000" class="custom-color" title="Custom color" />
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div class="footer-options">
+        <label class="checkbox-label">
+          <input type="checkbox" id="per-monitor-focus" checked />
+          <span class="checkmark"></span>
+          Per-monitor focus
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="blur-taskbar" />
+          <span class="checkmark"></span>
+          Blur taskbar
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="start-on-login" />
+          <span class="checkmark"></span>
+          Start on login
+        </label>
+      </div>
+      <span class="version">v0.1.0</span>
+    </div>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>
