@@ -507,9 +507,7 @@ mod imp {
         // capture bounds, so within ~3*stddev of each screen edge the blur
         // averages in that transparency and the edges fade/darken. HARD mode
         // extends the edge pixels, keeping the blur full-strength to the very
-        // edge of the screen. The residual edge bias (clamped pixels still read
-        // as an under-blurred strip) is then hidden by `overscan` at draw time.
-        // Set once — it isn't tied to the stddev.
+        // edge of the screen. Set once — it isn't tied to the stddev.
         {
             let props: &ID2D1Properties = (&gaussian).into();
             let mode = D2D1_BORDER_MODE_HARD.0 as u32;
@@ -819,9 +817,6 @@ mod imp {
                     };
                     ctx.PushLayer(&layer, None);
                 }
-                // Overscan so the bounded-blur edge band lands off-screen; the
-                // layer / target clips the overshoot back to the monitor.
-                ctx.SetTransform(&overscan(w, h, stddev));
                 ctx.DrawImage(
                     &output,
                     None,
@@ -829,7 +824,6 @@ mod imp {
                     D2D1_INTERPOLATION_MODE_LINEAR,
                     D2D1_COMPOSITE_MODE_SOURCE_OVER,
                 );
-                ctx.SetTransform(&identity());
                 if faded {
                     ctx.PopLayer();
                 }
@@ -887,10 +881,6 @@ mod imp {
                         layerOptions: D2D1_LAYER_OPTIONS1_NONE,
                     };
                     ctx.PushLayer(&layer, None);
-                    // Overscan the blurred band (gradient mask was captured in
-                    // screen space at PushLayer, so it stays put); reset before
-                    // PopLayer so the mask composites unscaled.
-                    ctx.SetTransform(&overscan(w, h, level));
                     ctx.DrawImage(
                         &output,
                         None,
@@ -898,7 +888,6 @@ mod imp {
                         D2D1_INTERPOLATION_MODE_LINEAR,
                         D2D1_COMPOSITE_MODE_SOURCE_OVER,
                     );
-                    ctx.SetTransform(&identity());
                     ctx.PopLayer();
                     let _ = std::mem::ManuallyDrop::into_inner(layer.opacityBrush);
                 }
@@ -964,33 +953,6 @@ mod imp {
             M22: 1.0,
             M31: 0.0,
             M32: 0.0,
-        }
-    }
-
-    // Overscan transform for the blurred image. A Gaussian blur bounded to the
-    // screen can't sample real content past the edges, so even with HARD border
-    // clamping the outermost ~k*stddev band is biased toward the replicated edge
-    // pixels and reads as a sharp, under-blurred strip — the classic bounded-blur
-    // edge artifact. This zooms the blurred image about the screen center just
-    // enough to push that band off-screen, so the visible edges sample
-    // fully-blurred interior pixels instead. The overshoot is clipped back to the
-    // screen by the surrounding layer / render target. Blurred content has no
-    // sharp features, so the slight scale is imperceptible — only ever apply this
-    // to blurred draws, never to the sharp ambient base. Identity when stddev≈0.
-    fn overscan(w: f32, h: f32, stddev: f32) -> windows_numerics::Matrix3x2 {
-        let inset = 2.5 * stddev; // edge pixels to hide per side
-        if inset <= 0.5 || inset * 2.0 >= w.min(h) {
-            return identity();
-        }
-        let sx = w / (w - 2.0 * inset);
-        let sy = h / (h - 2.0 * inset);
-        windows_numerics::Matrix3x2 {
-            M11: sx,
-            M12: 0.0,
-            M21: 0.0,
-            M22: sy,
-            M31: -sx * inset,
-            M32: -sy * inset,
         }
     }
 
