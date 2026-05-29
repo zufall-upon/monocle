@@ -66,6 +66,11 @@ const MAX_PUSHED: usize = 256;
 static OVERLAY_PER_MONITOR: AtomicBool = AtomicBool::new(true);
 static NEEDS_INITIAL_SETUP: AtomicBool = AtomicBool::new(false);
 static BLUR_TASKBAR: AtomicBool = AtomicBool::new(false);
+// True while the taskbar has been demoted out of the topmost band and pushed
+// below the overlay so the GPU blur composites over it. Tracks demotion so
+// deactivation — or toggling the setting off mid-session — can restore the
+// taskbar to its normal topmost, crisp, clickable state.
+static TASKBAR_DEMOTED: AtomicBool = AtomicBool::new(false);
 // Crossfade duration in milliseconds. Live-updated from settings via
 // `update_overlay`. Clamped to >= 1 tick when read so a 0-duration
 // setting still converges instead of dividing by zero.
@@ -586,6 +591,70 @@ unsafe fn restore_pushed_windows() {
     pushed.clear();
 }
 
+/// Every taskbar window across all monitors: the primary `Shell_TrayWnd` plus
+/// one `Shell_SecondaryTrayWnd` per additional monitor. `FindWindowW` only ever
+/// returns a single window of a class, so on multi-monitor setups it misses the
+/// secondary taskbars — we must enumerate to catch them all.
+#[cfg(windows)]
+fn all_taskbar_hwnds() -> Vec<isize> {
+    struct EnumState {
+        result: Vec<isize>,
+    }
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut EnumState);
+        let mut buf = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut buf);
+        if len > 0 {
+            let class = String::from_utf16_lossy(&buf[..len as usize]);
+            if class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" {
+                state.result.push(hwnd.0 as isize);
+            }
+        }
+        BOOL(1)
+    }
+    let mut state = EnumState { result: Vec::new() };
+    unsafe {
+        let _ = EnumWindows(Some(callback), LPARAM(&mut state as *mut EnumState as isize));
+    }
+    state.result
+}
+
+/// Drop every taskbar out of the topmost band and slot it just behind the
+/// overlay root. The GPU blur captures and blurs each full monitor (taskbar
+/// included), so once a real taskbar sits below the overlay its blurred copy
+/// shows through. Two steps, because the shell taskbar clings to topmost: first
+/// HWND_NOTOPMOST explicitly clears WS_EX_TOPMOST (a single insert-after a
+/// non-topmost window doesn't reliably strip it), then a second call lowers it
+/// below the overlay root in the non-topmost band. Re-running each tick
+/// re-demotes any taskbar whenever Explorer promotes it back to topmost.
+#[cfg(windows)]
+unsafe fn demote_taskbar(root_overlay: HWND) {
+    for tb_val in all_taskbar_hwnds() {
+        let tb = HWND(tb_val as *mut _);
+        let _ = SetWindowPos(
+            tb, Some(HWND_NOTOPMOST), 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let _ = SetWindowPos(
+            tb, Some(root_overlay), 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Return every taskbar to the topmost band so they're crisp and on top again.
+/// Called when the overlay deactivates or the blur-taskbar setting is turned
+/// off.
+#[cfg(windows)]
+unsafe fn restore_taskbar() {
+    for tb_val in all_taskbar_hwnds() {
+        let _ = SetWindowPos(
+            HWND(tb_val as *mut _), Some(HWND_TOPMOST), 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
 #[cfg(windows)]
 fn find_top_window_per_monitor(all_hwnds: &[isize]) -> HashMap<isize, isize> {
     struct EnumState { all_hwnds: Vec<isize>, result: HashMap<isize, isize> }
@@ -946,6 +1015,12 @@ fn foreground_tracker() {
                             // this active session. Hiding the overlay alone
                             // leaves them stuck at the bottom of z-order.
                             restore_pushed_windows();
+                            // If we demoted the taskbar to blur it, lift it
+                            // back into the topmost band so it's crisp and
+                            // clickable again now that Monocle is off.
+                            if TASKBAR_DEMOTED.swap(false, Ordering::Relaxed) {
+                                restore_taskbar();
+                            }
                             // Clear the focus rects so the GPU blur stops
                             // neutralizing any window region once we're off.
                             crate::gpu_blur::set_focus_rects(&[]);
@@ -1000,6 +1075,16 @@ fn foreground_tracker() {
             // change) uniformly.
             update_focus_rects(&monitor_focused);
 
+            // Taskbar blur: keep the taskbar demoted below the overlay each
+            // tick (re-demoting if Explorer promotes it back), or restore it
+            // if the setting was toggled off while Monocle is still active.
+            if BLUR_TASKBAR.load(Ordering::Relaxed) {
+                demote_taskbar(HWND(hwnds[0] as *mut _));
+                TASKBAR_DEMOTED.store(true, Ordering::Relaxed);
+            } else if TASKBAR_DEMOTED.swap(false, Ordering::Relaxed) {
+                restore_taskbar();
+            }
+
             if NEEDS_INITIAL_SETUP.swap(false, Ordering::Relaxed) {
                 monitor_focused.clear();
                 let top_windows = find_top_window_per_monitor(&hwnds);
@@ -1022,12 +1107,16 @@ fn foreground_tracker() {
                         let _ = SetWindowPos(HWND(hw as *mut _), Some(anchor), 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
                     }
                 }
-                // Keep taskbar above overlay on initial setup
-                if let Ok(tb) = FindWindowW(windows::core::w!("Shell_TrayWnd"), None) {
-                    let _ = SetWindowPos(tb, Some(anchor), 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-                }
-                if let Ok(tb2) = FindWindowW(windows::core::w!("Shell_SecondaryTrayWnd"), None) {
-                    let _ = SetWindowPos(tb2, Some(anchor), 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                // Keep taskbar above overlay on initial setup — unless the
+                // user opted to blur it, in which case the per-tick demote
+                // above pushes it below the overlay to be blurred instead.
+                if !BLUR_TASKBAR.load(Ordering::Relaxed) {
+                    if let Ok(tb) = FindWindowW(windows::core::w!("Shell_TrayWnd"), None) {
+                        let _ = SetWindowPos(tb, Some(anchor), 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                    }
+                    if let Ok(tb2) = FindWindowW(windows::core::w!("Shell_SecondaryTrayWnd"), None) {
+                        let _ = SetWindowPos(tb2, Some(anchor), 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                    }
                 }
                 last_fg = fg_val;
                 continue;
