@@ -26,7 +26,6 @@ const BLUR_LAYERS: usize = 10;
 const TOTAL_WINDOWS: usize = BLUR_LAYERS + 2;
 const TINT_IDX: usize = BLUR_LAYERS;     // 10
 const GRAIN_IDX: usize = BLUR_LAYERS + 1; // 11
-const DIM_CAP: f64 = 0.65;
 // Grain is a sparse, signed (bipolar) speckle pushed onto the grain window
 // with per-pixel premultiplied alpha (UpdateLayeredWindow). Most pixels are
 // fully transparent. This caps the layer alpha at slider = 100%: 0.27 was
@@ -50,6 +49,8 @@ const GRAIN_SATURATION: f64 = 0.55;
 // washes the image.
 const GRAIN_LIGHT: f64 = 200.0;
 const GRAIN_DARK: f64 = 35.0;
+// Max HSL colorize fraction applied to the GPU pipeline at slider 100%.
+const TINT_STRENGTH_MAX: f32 = 0.70;
 
 static ALL_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -767,15 +768,14 @@ unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
     let tint_hwnd = HWND(all_hwnds[TINT_IDX] as *mut _);
     let grain_hwnd = HWND(all_hwnds[GRAIN_IDX] as *mut _);
 
-    // --- Tint window [10]: dim capped at DIM_CAP ---
-    // Tint doubles as the input catcher (no WS_EX_TRANSPARENT). Per MSDN,
-    // hit-testing on an LWA_ALPHA window uses its alpha; alpha=0 lets clicks
-    // pass through. Force a 1/255 floor while the overlay is visible so we
-    // always intercept clicks, even when the user has dialed tint down to 0.
-    let raw_tint = (vis.tint_opacity * DIM_CAP * fade * 255.0).clamp(0.0, 255.0) as u8;
-    let tint_alpha = if fade > 0.0 { raw_tint.max(1) } else { 0 };
+    // --- Tint window [10] ---
+    // The tint is now an HSL "Color" blend folded into the GPU blur pipeline
+    // (see gpu_blur::set_tint), which truly colorizes the background instead
+    // of the flat alpha-over a layered window can do. This window is retained
+    // only as a z-order anchor in the ownership chain, so force it fully
+    // transparent.
     SetLayeredWindowAttributes(
-        tint_hwnd, windows::Win32::Foundation::COLORREF(0), tint_alpha, LWA_ALPHA,
+        tint_hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA,
     ).ok();
     set_accent(tint_hwnd, ACCENT_DISABLED, 0);
 
@@ -1321,6 +1321,17 @@ pub fn update_overlay(settings: &AppSettings, active: bool) {
     // longer driven).
     let gpu_stddev = (settings.gpu_blur_intensity as f32) * crate::gpu_blur::STDDEV_MAX;
     crate::gpu_blur::set_params(gpu_stddev, settings.desaturate_enabled);
+    // Tint colorizes the blurred background via an HSL "Color" blend in the
+    // GPU pipeline (luminance preserved, hue + saturation from the tint
+    // color). The opacity slider (0..1) is scaled by TINT_STRENGTH_MAX so the
+    // top of the slider lands on a tasteful colorize amount rather than a full
+    // duotone.
+    crate::gpu_blur::set_tint(
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        settings.tint_opacity as f32 * TINT_STRENGTH_MAX,
+    );
     crate::gpu_blur::set_active(active);
 
     // Deep-focus <-> ambient target. Snap instantly when (de)activating so the
