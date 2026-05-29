@@ -40,19 +40,48 @@
 
     <div class="controls">
       <div class="control-group">
-        <label class="control-label">
-          <span>Dim</span>
-          <span class="control-value" id="val-tint-opacity">40%</span>
-        </label>
-        <input type="range" id="tint-opacity" min="0" max="100" value="40" />
+        <div class="tint-control" id="tint-control">
+          <div class="control-row tint-main">
+            <button class="swatch-current control-icon" id="swatch-current" style="background:#0f172a" title="Tint color"></button>
+            <span class="control-name">Tint</span>
+            <input type="range" id="tint-opacity" min="0" max="100" value="40" />
+          </div>
+          <div class="tint-picker">
+            <div class="picker-header">
+              <button class="picker-back" id="picker-back" aria-label="Back">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
+                </svg>
+              </button>
+              <span class="picker-name" id="picker-name">Slate</span>
+            </div>
+            <div class="picker-swatches">
+              <input type="color" id="custom-color" value="#0f172a" class="custom-color" title="Custom color" />
+              <button class="swatch" data-color="#FF3B30" data-name="Red" style="background:#FF3B30"></button>
+              <button class="swatch" data-color="#FF9500" data-name="Orange" style="background:#FF9500"></button>
+              <button class="swatch" data-color="#FFCC00" data-name="Yellow" style="background:#FFCC00"></button>
+              <button class="swatch" data-color="#34C759" data-name="Green" style="background:#34C759"></button>
+              <button class="swatch" data-color="#30B0C7" data-name="Teal" style="background:#30B0C7"></button>
+              <button class="swatch" data-color="#007AFF" data-name="Blue" style="background:#007AFF"></button>
+              <button class="swatch" data-color="#5856D6" data-name="Indigo" style="background:#5856D6"></button>
+              <button class="swatch" data-color="#AF52DE" data-name="Purple" style="background:#AF52DE"></button>
+              <button class="swatch" data-color="#DB2D9E" data-name="Magenta" style="background:#DB2D9E"></button>
+              <button class="swatch" data-color="#FF375F" data-name="Pink" style="background:#FF375F"></button>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="control-group">
-        <label class="control-label">
-          <span>Blur</span>
-          <span class="control-value" id="val-blur">30%</span>
-        </label>
-        <input type="range" id="blur-intensity" min="0" max="100" value="30" />
+        <div class="control-row">
+          <span class="control-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9" stroke-dasharray="2 3"/><circle cx="12" cy="12" r="3.5"/>
+            </svg>
+          </span>
+          <span class="control-name">Blur</span>
+          <input type="range" id="blur-intensity" min="0" max="100" value="30" />
+        </div>
         <div class="seg-toggle" id="blur-mode">
           <button class="seg-btn active" data-mode="deep_focus">Deep focus</button>
           <button class="seg-btn" data-mode="ambient">Ambient</button>
@@ -60,43 +89,44 @@
       </div>
 
       <div class="control-group">
-        <label class="control-label">
-          <span>Grain</span>
-          <span class="control-value" id="val-grain">30%</span>
-        </label>
-        <input type="range" id="grain-amount" min="0" max="100" value="30" />
-      </div>
-
-      <div class="control-group">
-        <label class="control-label">
-          <span>Shake sensitivity</span>
-          <span class="control-value" id="val-shake">50%</span>
-        </label>
-        <input type="range" id="shake-sensitivity" min="0" max="100" value="50" />
-      </div>
-
-      <div class="control-group">
-        <label class="control-label">
-          <span>Crossfade</span>
-          <span class="control-value" id="val-fade">0.75s</span>
-        </label>
-        <input type="range" id="fade-duration" min="0" max="150" value="75" />
-      </div>
-
-      <div class="control-group color-group">
-        <label class="control-label">
-          <span>Tint color</span>
-        </label>
-        <div class="color-swatches">
-          <button class="swatch active" data-color="#000000" style="background:#000000"></button>
-          <button class="swatch" data-color="#0f172a" style="background:#0f172a"></button>
-          <button class="swatch" data-color="#1e1b4b" style="background:#1e1b4b"></button>
-          <button class="swatch" data-color="#172554" style="background:#172554"></button>
-          <button class="swatch" data-color="#14532d" style="background:#14532d"></button>
-          <button class="swatch" data-color="#422006" style="background:#422006"></button>
-          <input type="color" id="custom-color" value="#000000" class="custom-color" title="Custom color" />
+        <div class="control-row">
+          <span class="control-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+              <circle cx="6" cy="6" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="18" cy="7" r="1"/>
+              <circle cx="5" cy="12" r="1"/><circle cx="11" cy="12" r="1"/><circle cx="18" cy="13" r="1"/>
+              <circle cx="7" cy="18" r="1"/><circle cx="13" cy="19" r="1"/><circle cx="19" cy="18" r="1"/>
+            </svg>
+          </span>
+          <span class="control-name">Grain</span>
+          <input type="range" id="grain-amount" min="0" max="100" value="30" />
         </div>
       </div>
+
+      <div class="control-group">
+        <div class="control-row">
+          <span class="control-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 12c2.5-6 4.5-6 7 0s4.5 6 7 0 3-4 6-2"/>
+            </svg>
+          </span>
+          <span class="control-name">Shake</span>
+          <input type="range" id="shake-sensitivity" min="0" max="100" value="50" />
+        </div>
+      </div>
+
+      <div class="control-group">
+        <div class="control-row">
+          <span class="control-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/>
+            </svg>
+          </span>
+          <span class="control-name">Crossfade</span>
+          <input type="range" id="fade-duration" min="0" max="150" value="75" />
+          <span class="control-value" id="val-fade">0.75s</span>
+        </div>
+      </div>
+
     </div>
 
     <div class="footer">

@@ -15,17 +15,13 @@ async function init() {
 
 function applySettingsToUI(s) {
   document.getElementById("tint-opacity").value = s.tint_opacity * 100;
-  document.getElementById("val-tint-opacity").textContent = Math.round(s.tint_opacity * 100) + "%";
 
   document.getElementById("blur-intensity").value = s.gpu_blur_intensity * 100;
-  document.getElementById("val-blur").textContent = Math.round(s.gpu_blur_intensity * 100) + "%";
   setBlurModeUI(s.blur_mode || "deep_focus");
 
   document.getElementById("grain-amount").value = s.grain_amount * 100;
-  document.getElementById("val-grain").textContent = Math.round(s.grain_amount * 100) + "%";
 
   document.getElementById("shake-sensitivity").value = s.shake_sensitivity * 100;
-  document.getElementById("val-shake").textContent = Math.round(s.shake_sensitivity * 100) + "%";
 
   document.getElementById("fade-duration").value = Math.round(s.fade_duration_secs * 100);
   document.getElementById("val-fade").textContent = s.fade_duration_secs.toFixed(2) + "s";
@@ -35,14 +31,14 @@ function applySettingsToUI(s) {
   document.getElementById("blur-taskbar").checked = s.blur_taskbar;
   document.getElementById("start-on-login").checked = s.start_on_login;
 
-  // Set active color swatch
-  const swatches = document.querySelectorAll(".swatch");
-  swatches.forEach((sw) => sw.classList.remove("active"));
+  // Reflect the current tint color in the single circle + the palette.
+  document.getElementById("swatch-current").style.background = s.tint_color;
+  document.getElementById("custom-color").value = s.tint_color;
+  document.querySelectorAll(".swatch").forEach((sw) => sw.classList.remove("active"));
   const match = document.querySelector(`.swatch[data-color="${s.tint_color}"]`);
   if (match) {
     match.classList.add("active");
   }
-  document.getElementById("custom-color").value = s.tint_color;
 }
 
 function updateStatusUI(active) {
@@ -68,20 +64,22 @@ async function saveSettings() {
   await invoke("update_settings", { newSettings: settings });
 }
 
-// Slider bindings
+// Slider bindings. displayId is optional — sliders without a value label
+// (everything but Crossfade) pass none.
 function bindSlider(id, key, displayId) {
   const el = document.getElementById(id);
+  const display = displayId ? document.getElementById(displayId) : null;
   el.addEventListener("input", () => {
     const val = parseInt(el.value);
-    document.getElementById(displayId).textContent = val + "%";
+    if (display) display.textContent = val + "%";
     settings[key] = val / 100;
     saveSettings();
   });
 }
 
-bindSlider("tint-opacity", "tint_opacity", "val-tint-opacity");
-bindSlider("blur-intensity", "gpu_blur_intensity", "val-blur");
-bindSlider("grain-amount", "grain_amount", "val-grain");
+bindSlider("tint-opacity", "tint_opacity");
+bindSlider("blur-intensity", "gpu_blur_intensity");
+bindSlider("grain-amount", "grain_amount");
 
 // Blur mode segmented toggle: deep_focus (uniform) vs ambient (progressive).
 function setBlurModeUI(mode) {
@@ -97,7 +95,7 @@ document.querySelectorAll("#blur-mode .seg-btn").forEach((btn) => {
     saveSettings();
   });
 });
-bindSlider("shake-sensitivity", "shake_sensitivity", "val-shake");
+bindSlider("shake-sensitivity", "shake_sensitivity");
 
 // Crossfade duration: slider 0-150 represents 0.00-1.50 seconds.
 document.getElementById("fade-duration").addEventListener("input", (e) => {
@@ -119,21 +117,56 @@ document.getElementById("btn-close").addEventListener("click", () => {
   getCurrentWindow().hide();
 });
 
-// Color swatches
-document.querySelectorAll(".swatch").forEach((swatch) => {
-  swatch.addEventListener("click", () => {
-    document.querySelectorAll(".swatch").forEach((s) => s.classList.remove("active"));
-    swatch.classList.add("active");
-    settings.tint_color = swatch.dataset.color;
-    document.getElementById("custom-color").value = swatch.dataset.color;
-    saveSettings();
-  });
+// Tint color: a single circle that expands into the palette and collapses
+// once a color is picked.
+const tintControl = document.getElementById("tint-control");
+const swatchCurrent = document.getElementById("swatch-current");
+const pickerName = document.getElementById("picker-name");
+const pickerBack = document.getElementById("picker-back");
+
+// Map a hex color to its palette name, falling back to "Custom".
+function colorName(color) {
+  const match = document.querySelector(`.swatch[data-color="${color}"]`);
+  return match ? match.dataset.name : "Custom";
+}
+
+function setTintControlExpanded(expanded) {
+  if (expanded) pickerName.textContent = colorName(settings.tint_color);
+  tintControl.classList.toggle("expanded", expanded);
+}
+
+function selectTintColor(color) {
+  settings.tint_color = color;
+  swatchCurrent.style.background = color;
+  document.getElementById("custom-color").value = color;
+  document.querySelectorAll(".swatch").forEach((s) => s.classList.remove("active"));
+  const match = document.querySelector(`.swatch[data-color="${color}"]`);
+  if (match) match.classList.add("active");
+  pickerName.textContent = colorName(color);
+  saveSettings();
+}
+
+swatchCurrent.addEventListener("click", () => {
+  setTintControlExpanded(!tintControl.classList.contains("expanded"));
 });
 
-document.getElementById("custom-color").addEventListener("input", (e) => {
-  document.querySelectorAll(".swatch").forEach((s) => s.classList.remove("active"));
-  settings.tint_color = e.target.value;
-  saveSettings();
+pickerBack.addEventListener("click", () => setTintControlExpanded(false));
+
+// Stay in the picker while choosing so colors can be compared freely; the
+// back button (or a click outside) returns to the main row.
+document.querySelectorAll(".swatch").forEach((swatch) => {
+  swatch.addEventListener("click", () => selectTintColor(swatch.dataset.color));
+});
+
+// Custom picker: reflect the color live as it changes.
+const customColor = document.getElementById("custom-color");
+customColor.addEventListener("input", (e) => selectTintColor(e.target.value));
+
+// Collapse the palette when clicking anywhere outside the tint control.
+document.addEventListener("click", (e) => {
+  if (!tintControl.contains(e.target)) {
+    setTintControlExpanded(false);
+  }
 });
 
 // Desaturate background

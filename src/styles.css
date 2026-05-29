@@ -242,29 +242,128 @@ input[type="range"]::-webkit-slider-thumb:active {
   box-shadow: 0 0 0 1px var(--border);
 }
 
-/* Color swatches */
-.color-group {
+/* Inline control row: icon at far left, name, then slider (and an optional
+   value on the right). Icons share the 24px box so they line up vertically
+   with the tint swatch. */
+.control-row {
+  display: flex;
+  align-items: center;
   gap: 10px;
 }
 
-.color-swatches {
+.control-icon {
+  width: 24px;
+  height: 24px;
   display: flex;
-  gap: 6px;
   align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.control-name {
+  font-size: 12px;
+  font-weight: 500;
+  width: 66px;
+  flex-shrink: 0;
+}
+
+.control-row input[type="range"] {
+  flex: 1;
+}
+
+.control-row .control-value {
+  flex-shrink: 0;
+  min-width: 36px;
+}
+
+/* Tint: the collapsed row morphs into a two-line color picker. */
+.tint-control {
+  position: relative;
+}
+
+.tint-picker {
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tint-control.expanded .tint-main {
+  display: none;
+}
+
+.tint-control.expanded .tint-picker {
+  display: flex;
+  animation: picker-in 0.2s ease;
+}
+
+@keyframes picker-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.picker-back {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: all 0.15s;
+}
+
+.picker-back:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.picker-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.picker-swatches {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.swatch-current {
+  border-radius: 50%;
+  border: 2px solid var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+
+.swatch-current:hover {
+  transform: scale(1.1);
+  border-color: var(--text);
 }
 
 .swatch {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
   border: 2px solid transparent;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: box-shadow 0.15s, filter 0.15s;
   flex-shrink: 0;
 }
 
 .swatch:hover {
-  transform: scale(1.1);
+  filter: brightness(1.25);
 }
 
 .swatch.active {
@@ -273,14 +372,15 @@ input[type="range"]::-webkit-slider-thumb:active {
 }
 
 .custom-color {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
   border: 2px dashed #333;
   cursor: pointer;
   background: transparent;
   padding: 0;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .custom-color::-webkit-color-swatch-wrapper {
@@ -289,7 +389,7 @@ input[type="range"]::-webkit-slider-thumb:active {
 
 .custom-color::-webkit-color-swatch {
   border: none;
-  border-radius: 6px;
+  border-radius: 50%;
 }
 
 /* Footer */

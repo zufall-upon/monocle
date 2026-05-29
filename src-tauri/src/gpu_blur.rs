@@ -48,6 +48,16 @@ pub fn set_fade(progress: f64) {
     imp::set_fade(progress);
 }
 
+/// Tint applied to the blurred background as a Direct2D HSL "Color" blend:
+/// the background keeps its luminance (light/dark detail) but takes the
+/// hue + saturation of `(r, g, b)`. `strength` (0..=1) crossfades between
+/// the untinted and fully-colorized result. r/g/b are 0..=1. Called from
+/// `update_overlay` whenever settings change.
+#[cfg(windows)]
+pub fn set_tint(r: f32, g: f32, b: f32, strength: f32) {
+    imp::set_tint(r, g, b, strength);
+}
+
 /// Overlay active/inactive — controls window show/hide.
 #[cfg(windows)]
 pub fn set_active(active: bool) {
@@ -81,6 +91,8 @@ pub fn set_mode_mix(_mix: f64) {}
 #[cfg(not(windows))]
 pub fn set_fade(_progress: f64) {}
 #[cfg(not(windows))]
+pub fn set_tint(_r: f32, _g: f32, _b: f32, _strength: f32) {}
+#[cfg(not(windows))]
 pub fn set_active(_active: bool) {}
 #[cfg(not(windows))]
 pub fn reassert_z(_insert_after: isize) {}
@@ -102,20 +114,23 @@ mod imp {
     use windows::Graphics::DirectX::DirectXPixelFormat;
     use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Direct2D::Common::{
-        D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BORDER_MODE_HARD,
-        D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT,
-        D2D_RECT_F,
+        D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BLEND_MODE_COLOR,
+        D2D1_BORDER_MODE_HARD, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_GRADIENT_STOP,
+        D2D1_PIXEL_FORMAT, D2D_RECT_F,
     };
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, ID2D1Bitmap1, ID2D1Brush, ID2D1DeviceContext, ID2D1Effect,
-        ID2D1Factory1, ID2D1LinearGradientBrush, ID2D1Properties, ID2D1RenderTarget,
-        CLSID_D2D1GaussianBlur, CLSID_D2D1Saturation, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
-        D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_EXTEND_MODE_CLAMP,
-        D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2, D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+        ID2D1Factory1, ID2D1Image, ID2D1LinearGradientBrush, ID2D1Properties, ID2D1RenderTarget,
+        CLSID_D2D1Blend, CLSID_D2D1CrossFade, CLSID_D2D1Flood, CLSID_D2D1GaussianBlur,
+        CLSID_D2D1Saturation, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+        D2D1_BLEND_PROP_MODE, D2D1_CROSSFADE_PROP_WEIGHT, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+        D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FLOOD_PROP_COLOR,
+        D2D1_GAMMA_2_2, D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
         D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_LINEAR,
         D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
-        D2D1_PROPERTY_TYPE_ENUM, D2D1_PROPERTY_TYPE_FLOAT, D2D1_SATURATION_PROP_SATURATION,
+        D2D1_PROPERTY_TYPE_ENUM, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4,
+        D2D1_SATURATION_PROP_SATURATION,
     };
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
@@ -166,6 +181,13 @@ mod imp {
     // animator so switching modes dissolves smoothly. Mid-values render both
     // treatments and crossfade between them.
     static MODE_MIX_BITS: AtomicU64 = AtomicU64::new(0);
+    // Tint color (f32 bits, 0..1 per channel) and blend strength (f32 bits,
+    // 0..1). Applied as an HSL "Color" blend over the (de)saturated source —
+    // see draw(). Strength 0 = untinted; 1 = fully colorized.
+    static TINT_R_BITS: AtomicU32 = AtomicU32::new(0);
+    static TINT_G_BITS: AtomicU32 = AtomicU32::new(0);
+    static TINT_B_BITS: AtomicU32 = AtomicU32::new(0);
+    static TINT_STRENGTH_BITS: AtomicU32 = AtomicU32::new(0);
     static ACTIVE: AtomicBool = AtomicBool::new(false);
     // Every live blur window, so sync()/reassert_z() can address them all.
     static WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
@@ -182,6 +204,16 @@ mod imp {
     fn mode_mix() -> f64 {
         f64::from_bits(MODE_MIX_BITS.load(Ordering::Relaxed))
     }
+    fn tint_rgb() -> (f32, f32, f32) {
+        (
+            f32::from_bits(TINT_R_BITS.load(Ordering::Relaxed)),
+            f32::from_bits(TINT_G_BITS.load(Ordering::Relaxed)),
+            f32::from_bits(TINT_B_BITS.load(Ordering::Relaxed)),
+        )
+    }
+    fn tint_strength() -> f32 {
+        f32::from_bits(TINT_STRENGTH_BITS.load(Ordering::Relaxed))
+    }
 
     pub fn set_params(stddev: f32, desaturate: bool) {
         STDDEV_BITS.store(stddev.to_bits(), Ordering::Relaxed);
@@ -196,6 +228,14 @@ mod imp {
 
     pub fn set_fade(progress: f64) {
         FADE_BITS.store(progress.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        sync();
+    }
+
+    pub fn set_tint(r: f32, g: f32, b: f32, strength: f32) {
+        TINT_R_BITS.store(r.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        TINT_G_BITS.store(g.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        TINT_B_BITS.store(b.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        TINT_STRENGTH_BITS.store(strength.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         sync();
     }
 
@@ -283,6 +323,13 @@ mod imp {
         _dcomp: IDCompositionDevice,
         saturation: ID2D1Effect,
         gaussian: ID2D1Effect,
+        // Tint chain: flood (solid tint color) -> blend (HSL Color over the
+        // saturated source) -> crossfade (mix untinted<->colorized by
+        // strength). Output feeds the blur, so the whole background is tinted
+        // uniformly across both deep-focus and ambient treatments.
+        flood: ID2D1Effect,
+        blend: ID2D1Effect,
+        crossfade: ID2D1Effect,
         // Per-band vertical opacity gradients (transparent->opaque) used as
         // layer masks for ambient (progressive) blur. Each band feathers the
         // handoff between adjacent blur levels across its own screen slice.
@@ -433,9 +480,27 @@ mod imp {
         target.SetRoot(&visual)?;
         dcomp.Commit()?;
 
-        // --- Effect chain: cap_bmp -> saturation -> gaussian ---
+        // --- Effect chain: cap_bmp -> saturation -> [tint] -> gaussian ---
         let saturation = ctx.CreateEffect(&CLSID_D2D1Saturation)?;
         let gaussian = ctx.CreateEffect(&CLSID_D2D1GaussianBlur)?;
+
+        // Tint chain. The Color blend takes hue+saturation from its source
+        // (the flood color) and luminance from its destination (the saturated
+        // capture), i.e. a true colorize. CrossFade then mixes the untinted
+        // and colorized images by `strength`. Blend mode is set once; the
+        // flood color and crossfade weight are updated per-frame in draw().
+        let flood = ctx.CreateEffect(&CLSID_D2D1Flood)?;
+        let blend = ctx.CreateEffect(&CLSID_D2D1Blend)?;
+        let crossfade = ctx.CreateEffect(&CLSID_D2D1CrossFade)?;
+        {
+            let props: &ID2D1Properties = (&blend).into();
+            let mode = D2D1_BLEND_MODE_COLOR.0 as u32;
+            let _ = props.SetValue(
+                D2D1_BLEND_PROP_MODE.0 as u32,
+                D2D1_PROPERTY_TYPE_ENUM,
+                &mode.to_le_bytes(),
+            );
+        }
 
         // Clamp/extend edge pixels instead of padding with transparent black.
         // The default SOFT border mode samples transparent pixels beyond the
@@ -581,6 +646,9 @@ mod imp {
                 _dcomp: dcomp,
                 saturation,
                 gaussian,
+                flood,
+                blend,
+                crossfade,
                 grad_bands,
                 framepool,
                 d3d_ctx,
@@ -693,6 +761,32 @@ mod imp {
             set_saturation(&rs.saturation, if desaturate { 0.0 } else { 1.0 });
             let sat_out = rs.saturation.GetOutput()?;
 
+            // Tint: colorize the (de)saturated source before it fans out to the
+            // blur. Applied here (not on the raw capture) so the desaturate
+            // toggle can't strip the tint color back out. At strength ~0 we
+            // skip the blend chain and feed the source straight through.
+            let (tr, tg, tb) = tint_rgb();
+            let strength = tint_strength();
+            let src: ID2D1Image = if strength > 0.001 {
+                set_flood_color(&rs.flood, tr, tg, tb);
+                let flood_out = rs.flood.GetOutput()?;
+                // Color blend: dest (input 0) supplies luminance, source
+                // (input 1) supplies hue+saturation.
+                rs.blend.SetInput(0, &sat_out, true);
+                rs.blend.SetInput(1, &flood_out, true);
+                let blend_out = rs.blend.GetOutput()?;
+                // CrossFade output = input0*weight + input1*(1-weight), so put
+                // the colorized image on input 0 and the untinted one on input
+                // 1. Weight then reads directly as the colorize amount: 0 =
+                // untinted, `strength` = how strongly to tint.
+                rs.crossfade.SetInput(0, &blend_out, true);
+                rs.crossfade.SetInput(1, &sat_out, true);
+                set_crossfade_weight(&rs.crossfade, strength);
+                rs.crossfade.GetOutput()?
+            } else {
+                sat_out.clone()
+            };
+
             // Deep-focus <-> ambient blend. 0 = uniform (deep focus), 1 =
             // progressive (ambient). Mid-values render both and crossfade so
             // the mode switch dissolves smoothly instead of cutting hard.
@@ -706,7 +800,7 @@ mod imp {
             // both treatments are full blur, so the still-opaque deep layer
             // never reads as a double image.
             if show_deep {
-                rs.gaussian.SetInput(0, &sat_out, true);
+                rs.gaussian.SetInput(0, &src, true);
                 set_blur(&rs.gaussian, stddev);
                 let output = rs.gaussian.GetOutput()?;
 
@@ -760,7 +854,7 @@ mod imp {
 
                 // Sharp base (blur 0).
                 ctx.DrawImage(
-                    &sat_out,
+                    &src,
                     None,
                     Some(&source_rect),
                     D2D1_INTERPOLATION_MODE_LINEAR,
@@ -768,7 +862,7 @@ mod imp {
                 );
 
                 // Stack increasingly-blurred bands, each masked by its gradient.
-                rs.gaussian.SetInput(0, &sat_out, true);
+                rs.gaussian.SetInput(0, &src, true);
                 let n = rs.grad_bands.len() as f32;
                 for (idx, band) in rs.grad_bands.iter().enumerate() {
                     let level = stddev * (idx as f32 + 1.0) / n;
@@ -824,6 +918,30 @@ mod imp {
             D2D1_SATURATION_PROP_SATURATION.0 as u32,
             D2D1_PROPERTY_TYPE_FLOAT,
             &value.to_le_bytes(),
+        );
+    }
+
+    unsafe fn set_flood_color(flood: &ID2D1Effect, r: f32, g: f32, b: f32) {
+        // D2D1_FLOOD_PROP_COLOR is a VECTOR4 (R, G, B, A) of f32.
+        let props: &ID2D1Properties = flood.into();
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&r.to_le_bytes());
+        buf[4..8].copy_from_slice(&g.to_le_bytes());
+        buf[8..12].copy_from_slice(&b.to_le_bytes());
+        buf[12..16].copy_from_slice(&1.0f32.to_le_bytes());
+        let _ = props.SetValue(
+            D2D1_FLOOD_PROP_COLOR.0 as u32,
+            D2D1_PROPERTY_TYPE_VECTOR4,
+            &buf,
+        );
+    }
+
+    unsafe fn set_crossfade_weight(crossfade: &ID2D1Effect, weight: f32) {
+        let props: &ID2D1Properties = crossfade.into();
+        let _ = props.SetValue(
+            D2D1_CROSSFADE_PROP_WEIGHT.0 as u32,
+            D2D1_PROPERTY_TYPE_FLOAT,
+            &weight.to_le_bytes(),
         );
     }
 
