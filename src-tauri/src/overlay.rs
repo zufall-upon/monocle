@@ -27,7 +27,29 @@ const TOTAL_WINDOWS: usize = BLUR_LAYERS + 2;
 const TINT_IDX: usize = BLUR_LAYERS;     // 10
 const GRAIN_IDX: usize = BLUR_LAYERS + 1; // 11
 const DIM_CAP: f64 = 0.65;
-const GRAIN_MAX_ALPHA: f64 = 0.20;
+// Grain is a sparse, signed (bipolar) speckle pushed onto the grain window
+// with per-pixel premultiplied alpha (UpdateLayeredWindow). Most pixels are
+// fully transparent. This caps the layer alpha at slider = 100%: 0.27 was
+// chosen so full slider matches what the old 0.90 cap produced at the 30%
+// slider position (0.3 x 0.90), which read as the right maximum intensity.
+const GRAIN_MAX_ALPHA: f64 = 0.27;
+// |z| below this -> no speck (transparent). Keeps grain sparse: a thin layer
+// of sand on paper, not a full gray wash.
+const GRAIN_THRESHOLD: f64 = 0.55;
+// Maps |z| above the threshold to per-speck alpha (0..1).
+const GRAIN_GAIN: f64 = 0.60;
+// Each speck is given a random hue at this saturation (HSV), emulating color
+// film's three R/G/B emulsion layers -> random colored speckles. Saturation is
+// decoupled from brightness, so this controls "how colorful" independently of
+// how bright/dark the speck is. ~0.5 reads as clearly tinted film grain;
+// raise toward 0.8 for punchier FilmConvert-style color, drop toward 0.2 for
+// near-monochrome. Jittered per speck so not every grain is equally saturated.
+const GRAIN_SATURATION: f64 = 0.55;
+// HSV "value" of a "brighten" speck (positive z) and a "darken" speck (negative
+// z), 0..255. Bright and dark roughly balance, so grain perturbs rather than
+// washes the image.
+const GRAIN_LIGHT: f64 = 200.0;
+const GRAIN_DARK: f64 = 35.0;
 
 static ALL_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -95,18 +117,24 @@ static VISUALS: Mutex<OverlayVisuals> = Mutex::new(OverlayVisuals {
 
 static OVERLAY_COLOR: Mutex<u32> = Mutex::new(0);
 
-// Grain dynamically becomes click-through when the cursor is over a
-// background window's non-client area (title bar, caption buttons,
-// borders) so drag-to-move and close/min/max work in one continuous
-// gesture. The polling timer re-arms grain once the cursor returns to
-// a client area — once WS_EX_TRANSPARENT is set, grain stops receiving
+// The input-catcher window (tint [10]) dynamically becomes click-through when
+// the cursor is over a background window's non-client area (title bar, caption
+// buttons, borders) so drag-to-move and close/min/max work in one continuous
+// gesture. The polling timer re-arms the catcher once the cursor returns to a
+// client area — once WS_EX_TRANSPARENT is set, the catcher stops receiving
 // WM_MOUSEMOVE and only WM_TIMER can detect the move-back.
-static GRAIN_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
-const GRAIN_POLL_TIMER: usize = 1;
-const GRAIN_POLL_MS: u32 = 16;
+static CATCHER_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
+const CATCHER_POLL_TIMER: usize = 1;
+const CATCHER_POLL_MS: u32 = 16;
 
-// Noise bitmap DC for grain rendering
+// Premultiplied-BGRA noise tile DC: the source pattern that's tiled across the
+// full-screen grain surface. Built once at init.
 static NOISE_DC: Mutex<Option<isize>> = Mutex::new(None);
+// Full-virtual-screen premultiplied grain surface (tiled from NOISE_DC) and its
+// size. Pushed onto the grain window via UpdateLayeredWindow; the slider only
+// scales it (SourceConstantAlpha), so it never needs rebuilding.
+static GRAIN_DC: Mutex<Option<isize>> = Mutex::new(None);
+static GRAIN_SIZE: Mutex<(i32, i32)> = Mutex::new((0, 0));
 const NOISE_TILE: i32 = 1024;
 
 // --- SetWindowCompositionAttribute ---
@@ -183,14 +211,51 @@ fn set_accent(hwnd: HWND, accent_state: i32, gradient_color: u32) {
     unsafe { f(hwnd, &mut data); }
 }
 
-// --- Noise bitmap generation ---
+// --- Grain surface generation ---
 
+/// Marsaglia xorshift32 -> uniform (0,1]. Advances `state` in place.
+#[cfg(windows)]
+fn xorshift(state: &mut u32) -> f64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    (*state as f64) / (u32::MAX as f64)
+}
+
+/// HSV -> RGB. `h` in degrees [0,360), `s`/`v` in [0,1]. Returns each channel
+/// in [0,255]. Used to give each grain speck a random hue at a controlled
+/// saturation, so color intensity is independent of the speck's brightness.
+#[cfg(windows)]
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
+    let h = (h.rem_euclid(360.0)) / 60.0;
+    let c = v * s;
+    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
+    let m = v - c;
+    let (r1, g1, b1) = match h as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    ((r1 + m) * 255.0, (g1 + m) * 255.0, (b1 + m) * 255.0)
+}
+
+/// Build the premultiplied-BGRA bipolar colored noise tile.
+///
+/// Pixel layout is 0xAARRGGBB with RGB already multiplied by alpha (the format
+/// UpdateLayeredWindow expects with AC_SRC_ALPHA). Most pixels are 0 (fully
+/// transparent) so the image behind is untouched. A Gaussian sample decides
+/// each speck: |z| above a threshold becomes a speck, its sign picks bright vs
+/// dark, and per-channel chroma jitter tints it. Bright and dark specks roughly
+/// balance, so grain perturbs the image rather than washing it toward gray.
 #[cfg(windows)]
 unsafe fn create_noise_bitmap() {
     let screen_dc = GetDC(None);
     let mem_dc = CreateCompatibleDC(Some(screen_dc));
 
-    let mut bmi = BITMAPINFO {
+    let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: NOISE_TILE,
@@ -207,48 +272,130 @@ unsafe fn create_noise_bitmap() {
     let Ok(hbitmap) = CreateDIBSection(
         Some(screen_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0,
     ) else {
-        DeleteDC(mem_dc);
+        let _ = DeleteDC(mem_dc);
         ReleaseDC(None, screen_dc);
         return;
     };
 
     SelectObject(mem_dc, hbitmap.into());
 
-    // Gaussian noise centered on 128 (neutral gray) using Box-Muller transform.
-    // Most pixels cluster near 128 (invisible at low alpha), with occasional
-    // bright/dark spots that create organic, film-like grain.
     let pixels = bits as *mut u32;
     let count = (NOISE_TILE * NOISE_TILE) as usize;
     let mut state: u32 = 0xDEADBEEF;
-    let std_dev: f64 = 50.0;
 
-    let mut i = 0;
-    while i < count {
-        // Generate two uniform randoms via xorshift
-        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
-        let u1 = (state as f64) / (u32::MAX as f64);
-        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
-        let u2 = (state as f64) / (u32::MAX as f64);
+    for i in 0..count {
+        // Box-Muller: one Gaussian sample (z, std-dev 1) from two uniforms.
+        let u1 = xorshift(&mut state).max(1e-10);
+        let u2 = xorshift(&mut state);
+        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
 
-        // Box-Muller: two Gaussian samples from two uniform samples
-        let u1_safe = if u1 < 1e-10 { 1e-10 } else { u1 };
-        let mag = std_dev * (-2.0 * u1_safe.ln()).sqrt();
-        let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
-        let z1 = mag * (2.0 * std::f64::consts::PI * u2).sin();
-
-        let v0 = (128.0 + z0).clamp(0.0, 255.0) as u32;
-        let v1 = (128.0 + z1).clamp(0.0, 255.0) as u32;
-
-        *pixels.add(i) = 0xFF000000 | (v0 << 16) | (v0 << 8) | v0;
-        i += 1;
-        if i < count {
-            *pixels.add(i) = 0xFF000000 | (v1 << 16) | (v1 << 8) | v1;
-            i += 1;
+        let alpha_f = ((z.abs() - GRAIN_THRESHOLD) * GRAIN_GAIN).clamp(0.0, 1.0);
+        if alpha_f <= 0.0 {
+            *pixels.add(i) = 0; // transparent, image untouched
+            continue;
         }
+
+        let hue = xorshift(&mut state) * 360.0;
+        // Jitter saturation ±0.2 around the base so specks vary in colorfulness.
+        let sat = (GRAIN_SATURATION + (xorshift(&mut state) - 0.5) * 0.4).clamp(0.0, 1.0);
+        let val = if z >= 0.0 { GRAIN_LIGHT } else { GRAIN_DARK } / 255.0;
+        let (r, g, b) = hsv_to_rgb(hue, sat, val);
+
+        let a = (alpha_f * 255.0).round() as u32;
+        let pr = (r * alpha_f).round() as u32; // premultiply
+        let pg = (g * alpha_f).round() as u32;
+        let pb = (b * alpha_f).round() as u32;
+        *pixels.add(i) = (a << 24) | (pr << 16) | (pg << 8) | pb;
     }
 
     ReleaseDC(None, screen_dc);
     *NOISE_DC.lock().unwrap() = Some(mem_dc.0 as isize);
+}
+
+/// Tile the noise pattern across a full-virtual-screen premultiplied surface.
+/// SRCCOPY copies the raw premultiplied bytes (alpha included) verbatim, so the
+/// tiled surface stays a valid AC_SRC_ALPHA source. Built once at init.
+#[cfg(windows)]
+unsafe fn create_grain_surface(width: i32, height: i32) {
+    let noise = NOISE_DC.lock().unwrap();
+    let Some(ndc_val) = *noise else { return };
+    let ndc = HDC(ndc_val as *mut _);
+    drop(noise);
+
+    let screen_dc = GetDC(None);
+    let mem_dc = CreateCompatibleDC(Some(screen_dc));
+
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0 as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let Ok(hbitmap) = CreateDIBSection(
+        Some(screen_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0,
+    ) else {
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(None, screen_dc);
+        return;
+    };
+
+    SelectObject(mem_dc, hbitmap.into());
+
+    let mut y = 0;
+    while y < height {
+        let mut x = 0;
+        while x < width {
+            let w = (width - x).min(NOISE_TILE);
+            let h = (height - y).min(NOISE_TILE);
+            let _ = BitBlt(mem_dc, x, y, w, h, Some(ndc), 0, 0, SRCCOPY);
+            x += NOISE_TILE;
+        }
+        y += NOISE_TILE;
+    }
+
+    ReleaseDC(None, screen_dc);
+    *GRAIN_DC.lock().unwrap() = Some(mem_dc.0 as isize);
+    *GRAIN_SIZE.lock().unwrap() = (width, height);
+}
+
+/// Push the grain surface onto the grain window with per-pixel alpha. `strength`
+/// (0..255) drives SourceConstantAlpha, scaling the whole layer in one call so
+/// the baked surface never has to be regenerated as the slider moves.
+#[cfg(windows)]
+unsafe fn update_grain_layer(grain_hwnd: HWND, strength: u8) {
+    let grain = GRAIN_DC.lock().unwrap();
+    let Some(gdc_val) = *grain else { return };
+    let gdc = HDC(gdc_val as *mut _);
+    let (w, h) = *GRAIN_SIZE.lock().unwrap();
+    if w == 0 || h == 0 { return; }
+
+    let size = windows::Win32::Foundation::SIZE { cx: w, cy: h };
+    let src = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION {
+        BlendOp: 0,    // AC_SRC_OVER
+        BlendFlags: 0,
+        SourceConstantAlpha: strength,
+        AlphaFormat: 1, // AC_SRC_ALPHA (source is premultiplied)
+    };
+    let _ = UpdateLayeredWindow(
+        grain_hwnd,
+        None,
+        None,
+        Some(&size),
+        Some(gdc),
+        Some(&src),
+        windows::Win32::Foundation::COLORREF(0),
+        Some(&blend),
+        ULW_ALPHA,
+    );
 }
 
 // --- Window helpers ---
@@ -538,22 +685,22 @@ fn find_window_at_point(pt: windows::Win32::Foundation::POINT, all_hwnds: &[isiz
     state.result
 }
 
-/// Toggle WS_EX_TRANSPARENT on the grain layer. When on, hit-testing
-/// passes the cursor (and clicks) through to the window underneath.
+/// Toggle WS_EX_TRANSPARENT on the input-catcher layer (tint). When on,
+/// hit-testing passes the cursor (and clicks) through to the window underneath.
 #[cfg(windows)]
-fn set_grain_passthrough_style(grain_hwnd: HWND, on: bool) {
+fn set_catcher_passthrough_style(catcher_hwnd: HWND, on: bool) {
     unsafe {
-        let cur = GetWindowLongW(grain_hwnd, GWL_EXSTYLE) as u32;
+        let cur = GetWindowLongW(catcher_hwnd, GWL_EXSTYLE) as u32;
         let new = if on {
             cur | WS_EX_TRANSPARENT.0
         } else {
             cur & !WS_EX_TRANSPARENT.0
         };
         if new != cur {
-            SetWindowLongW(grain_hwnd, GWL_EXSTYLE, new as i32);
+            SetWindowLongW(catcher_hwnd, GWL_EXSTYLE, new as i32);
         }
     }
-    GRAIN_PASSTHROUGH.store(on, Ordering::Relaxed);
+    CATCHER_PASSTHROUGH.store(on, Ordering::Relaxed);
 }
 
 /// Does the cursor want grain to be click-through? True if the window
@@ -621,23 +768,25 @@ unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
     let grain_hwnd = HWND(all_hwnds[GRAIN_IDX] as *mut _);
 
     // --- Tint window [10]: dim capped at DIM_CAP ---
-    let tint_alpha = (vis.tint_opacity * DIM_CAP * fade * 255.0).clamp(0.0, 255.0) as u8;
+    // Tint doubles as the input catcher (no WS_EX_TRANSPARENT). Per MSDN,
+    // hit-testing on an LWA_ALPHA window uses its alpha; alpha=0 lets clicks
+    // pass through. Force a 1/255 floor while the overlay is visible so we
+    // always intercept clicks, even when the user has dialed tint down to 0.
+    let raw_tint = (vis.tint_opacity * DIM_CAP * fade * 255.0).clamp(0.0, 255.0) as u8;
+    let tint_alpha = if fade > 0.0 { raw_tint.max(1) } else { 0 };
     SetLayeredWindowAttributes(
         tint_hwnd, windows::Win32::Foundation::COLORREF(0), tint_alpha, LWA_ALPHA,
     ).ok();
     set_accent(tint_hwnd, ACCENT_DISABLED, 0);
 
     // --- Grain window [11] ---
-    // Grain doubles as the input catcher (no WS_EX_TRANSPARENT). Per
-    // MSDN, hit-testing on a layered window uses the LWA_ALPHA value;
-    // alpha=0 lets clicks pass through. Force a 1/255 floor while the
-    // overlay is visible so we always intercept clicks, even when the
-    // user has dialed grain down to 0.
-    let raw_grain = (vis.grain_amount * GRAIN_MAX_ALPHA * fade * 255.0).clamp(0.0, 255.0) as u8;
-    let grain_alpha = if fade > 0.0 { raw_grain.max(1) } else { 0 };
-    SetLayeredWindowAttributes(
-        grain_hwnd, windows::Win32::Foundation::COLORREF(0), grain_alpha, LWA_ALPHA,
-    ).ok();
+    // Per-pixel premultiplied alpha via UpdateLayeredWindow: sparse signed
+    // colored specks. The slider scales the whole layer through
+    // SourceConstantAlpha. Grain is click-through (WS_EX_TRANSPARENT) and never
+    // gets SetLayeredWindowAttributes — that would knock it out of ULW mode.
+    let grain_strength = (vis.grain_amount * GRAIN_MAX_ALPHA * fade * 255.0)
+        .clamp(0.0, 255.0) as u8;
+    update_grain_layer(grain_hwnd, grain_strength);
 
     // --- Blur layers [0..9] ---
     // The old acrylic-blur path (SetWindowCompositionAttribute +
@@ -681,6 +830,11 @@ pub fn init() {
             let sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
 
+            // Bake the full-virtual-screen grain surface once (tiled from the
+            // noise pattern created above). The grain window is driven from it
+            // via UpdateLayeredWindow each fade tick.
+            create_grain_surface(sw, sh);
+
             let mut hwnds = Vec::with_capacity(TOTAL_WINDOWS);
             for i in 0..TOTAL_WINDOWS {
                 // Each window is owned by the previous one, creating a z-order chain.
@@ -690,11 +844,12 @@ pub fn init() {
                 } else {
                     Some(HWND(hwnds[i - 1] as *mut _))
                 };
-                // The topmost layer (grain) catches mouse input so we can
-                // force the cursor to an arrow and absorb stray clicks on
-                // blurred background apps. All other layers stay
-                // click-through.
-                let ex_style = if i == GRAIN_IDX {
+                // The tint layer catches mouse input so we can force the
+                // cursor to an arrow and absorb stray clicks on blurred
+                // background apps. Grain sits above it but is click-through
+                // (its per-pixel ULW surface plus WS_EX_TRANSPARENT pass every
+                // click down to tint). All other layers stay click-through too.
+                let ex_style = if i == TINT_IDX {
                     WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
                 } else {
                     WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
@@ -705,9 +860,14 @@ pub fn init() {
                     WS_POPUP, sx, sy, sw, sh,
                     owner, None, Some(hinstance.into()), None,
                 ).expect("Failed to create overlay window");
-                SetLayeredWindowAttributes(
-                    hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA,
-                ).ok();
+                // Grain is driven exclusively by UpdateLayeredWindow; calling
+                // SetLayeredWindowAttributes on it would knock it back into
+                // uniform-alpha mode, so leave it untouched here.
+                if i != GRAIN_IDX {
+                    SetLayeredWindowAttributes(
+                        hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA,
+                    ).ok();
+                }
                 // Exclude every overlay window from screen capture so the
                 // GPU blur's capture pipeline never ingests our own
                 // dim/grain/blur output — it must only ever see real apps.
@@ -1033,17 +1193,18 @@ fn foreground_tracker() {
     }
 }
 
-/// [0]=grain (tiles noise), [1]=tint (solid color), [2..]=blur (no paint)
+/// [10]=tint (solid color + input catcher), [11]=grain (ULW noise),
+/// [0..9]=blur (no paint).
 #[cfg(windows)]
 unsafe extern "system" fn overlay_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // Grain doubles as the input catcher for the entire overlay group.
+    // Tint doubles as the input catcher for the entire overlay group.
     // Force the arrow cursor, refuse activation, and translate clicks
     // into focus-only "raise window" actions on the app underneath.
-    let is_grain = {
+    let is_catcher = {
         let hwnds = ALL_HWNDS.lock().unwrap();
-        hwnds.get(GRAIN_IDX) == Some(&(hwnd.0 as isize))
+        hwnds.get(TINT_IDX) == Some(&(hwnd.0 as isize))
     };
-    if is_grain {
+    if is_catcher {
         match msg {
             WM_SETCURSOR => {
                 if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
@@ -1059,26 +1220,26 @@ unsafe extern "system" fn overlay_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
                 let _ = GetCursorPos(&mut pt);
                 let snapshot: Vec<isize> = ALL_HWNDS.lock().unwrap().clone();
                 if cursor_wants_passthrough(pt, &snapshot)
-                    && !GRAIN_PASSTHROUGH.load(Ordering::Relaxed)
+                    && !CATCHER_PASSTHROUGH.load(Ordering::Relaxed)
                 {
-                    set_grain_passthrough_style(hwnd, true);
-                    SetTimer(Some(hwnd), GRAIN_POLL_TIMER, GRAIN_POLL_MS, None);
+                    set_catcher_passthrough_style(hwnd, true);
+                    SetTimer(Some(hwnd), CATCHER_POLL_TIMER, CATCHER_POLL_MS, None);
                 }
                 return LRESULT(0);
             }
             WM_TIMER => {
-                if wparam.0 == GRAIN_POLL_TIMER {
+                if wparam.0 == CATCHER_POLL_TIMER {
                     if !IsWindowVisible(hwnd).as_bool() {
-                        let _ = KillTimer(Some(hwnd), GRAIN_POLL_TIMER);
-                        set_grain_passthrough_style(hwnd, false);
+                        let _ = KillTimer(Some(hwnd), CATCHER_POLL_TIMER);
+                        set_catcher_passthrough_style(hwnd, false);
                         return LRESULT(0);
                     }
                     let mut pt = windows::Win32::Foundation::POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let snapshot: Vec<isize> = ALL_HWNDS.lock().unwrap().clone();
                     if !cursor_wants_passthrough(pt, &snapshot) {
-                        let _ = KillTimer(Some(hwnd), GRAIN_POLL_TIMER);
-                        set_grain_passthrough_style(hwnd, false);
+                        let _ = KillTimer(Some(hwnd), CATCHER_POLL_TIMER);
+                        set_catcher_passthrough_style(hwnd, false);
                     }
                 }
                 return LRESULT(0);
@@ -1115,29 +1276,9 @@ unsafe extern "system" fn overlay_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
             let hwnds = ALL_HWNDS.lock().unwrap();
             let hwnd_val = hwnd.0 as isize;
 
-            if hwnds.get(GRAIN_IDX) == Some(&hwnd_val) {
-                // Grain [11]: tile noise bitmap across the window
-                let noise_dc = NOISE_DC.lock().unwrap();
-                if let Some(ndc_val) = *noise_dc {
-                    let ndc = HDC(ndc_val as *mut _);
-                    let r = &ps.rcPaint;
-                    let mut y = r.top;
-                    while y < r.bottom {
-                        let mut x = r.left;
-                        while x < r.right {
-                            let w = (r.right - x).min(NOISE_TILE);
-                            let h = (r.bottom - y).min(NOISE_TILE);
-                            let src_x = ((x % NOISE_TILE) + NOISE_TILE) % NOISE_TILE;
-                            let src_y = ((y % NOISE_TILE) + NOISE_TILE) % NOISE_TILE;
-                            let bw = w.min(NOISE_TILE - src_x);
-                            let bh = h.min(NOISE_TILE - src_y);
-                            let _ = BitBlt(hdc, x, y, bw, bh, Some(ndc), src_x, src_y, SRCCOPY);
-                            x += bw;
-                        }
-                        y += NOISE_TILE;
-                    }
-                }
-            } else if hwnds.get(TINT_IDX) == Some(&hwnd_val) {
+            // Grain [11] is painted via UpdateLayeredWindow, not WM_PAINT, so
+            // only the tint window draws here.
+            if hwnds.get(TINT_IDX) == Some(&hwnd_val) {
                 // Tint [10]: solid color
                 let color = *OVERLAY_COLOR.lock().unwrap();
                 let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(color));
@@ -1213,9 +1354,10 @@ pub fn update_overlay(settings: &AppSettings, active: bool) {
             let progress = if fade.animating { fade.progress } else { 1.0 };
             let target = fade.target;
             drop(fade);
+            // apply_all re-pushes the grain surface via UpdateLayeredWindow;
+            // only the tint window needs a WM_PAINT repaint (its solid color).
             apply_all(&hwnds, &vis, ease_for_target(progress, target));
             let _ = InvalidateRect(Some(HWND(hwnds[TINT_IDX] as *mut _)), None, true);
-            let _ = InvalidateRect(Some(HWND(hwnds[GRAIN_IDX] as *mut _)), None, true);
             return;
         }
 
@@ -1242,8 +1384,11 @@ pub fn update_overlay(settings: &AppSettings, active: bool) {
         } else { Some(HWND_TOP) };
 
         // Position root (hwnds[0]) behind fg. Ownership chain guarantees
-        // all other overlay windows stay above the root.
-        for &hwnd_val in &hwnds {
+        // all other overlay windows stay above the root. Skip grain: it's a
+        // ULW window, and SetLayeredWindowAttributes would knock it out of
+        // per-pixel mode (apply_all re-pushes its surface via the fade).
+        for (i, &hwnd_val) in hwnds.iter().enumerate() {
+            if i == GRAIN_IDX { continue; }
             let hwnd = HWND(hwnd_val as *mut _);
             SetLayeredWindowAttributes(
                 hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA,
