@@ -1,13 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+fn default_fade_duration_secs() -> f64 { 0.75 }
+fn default_gpu_blur_intensity() -> f64 { 0.3 }
+fn default_blur_mode() -> String { "deep_focus".into() }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
-    pub blur_enabled: bool,
-    pub blur_intensity: f64,
+    // GPU Gaussian blur strength (0..1 -> stddev 0..STDDEV_MAX). The
+    // capture-based blur (gpu_blur) — the only blur now; the old acrylic
+    // `blur_enabled`/`blur_intensity` settings have been retired.
+    #[serde(default = "default_gpu_blur_intensity")]
+    pub gpu_blur_intensity: f64,
+    // "deep_focus": uniform full-screen blur. "ambient": progressive blur,
+    // sharp at the top of the screen ramping to full blur at the bottom.
+    #[serde(default = "default_blur_mode")]
+    pub blur_mode: String,
     pub grain_amount: f64,
+    #[serde(default)]
+    pub desaturate_enabled: bool,
     pub tint_color: String,
     pub tint_opacity: f64,
     pub shake_sensitivity: f64,
+    #[serde(default = "default_fade_duration_secs")]
+    pub fade_duration_secs: f64,
     pub per_monitor_focus: bool,
     pub blur_taskbar: bool,
     pub start_on_login: bool,
@@ -16,12 +31,14 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            blur_enabled: true,
-            blur_intensity: 0.6,
-            grain_amount: 0.3,
+            gpu_blur_intensity: default_gpu_blur_intensity(),
+            blur_mode: default_blur_mode(),
+            grain_amount: 0.5,
+            desaturate_enabled: false,
             tint_color: "#000000".into(),
-            tint_opacity: 0.4,
+            tint_opacity: 0.1,
             shake_sensitivity: 0.5,
+            fade_duration_secs: default_fade_duration_secs(),
             per_monitor_focus: true,
             blur_taskbar: false,
             start_on_login: false,

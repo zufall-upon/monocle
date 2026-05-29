@@ -49,14 +49,14 @@
 
       <div class="control-group">
         <label class="control-label">
-          <label class="checkbox-label compact">
-            <input type="checkbox" id="blur-enabled" checked />
-            <span class="checkmark"></span>
-            Blur
-          </label>
-          <span class="control-value" id="val-blur">60%</span>
+          <span>Blur</span>
+          <span class="control-value" id="val-blur">30%</span>
         </label>
-        <input type="range" id="blur-intensity" min="0" max="100" value="60" />
+        <input type="range" id="blur-intensity" min="0" max="100" value="30" />
+        <div class="seg-toggle" id="blur-mode">
+          <button class="seg-btn active" data-mode="deep_focus">Deep focus</button>
+          <button class="seg-btn" data-mode="ambient">Ambient</button>
+        </div>
       </div>
 
       <div class="control-group">
@@ -73,6 +73,14 @@
           <span class="control-value" id="val-shake">50%</span>
         </label>
         <input type="range" id="shake-sensitivity" min="0" max="100" value="50" />
+      </div>
+
+      <div class="control-group">
+        <label class="control-label">
+          <span>Crossfade</span>
+          <span class="control-value" id="val-fade">0.75s</span>
+        </label>
+        <input type="range" id="fade-duration" min="0" max="150" value="75" />
       </div>
 
       <div class="control-group color-group">
@@ -93,6 +101,11 @@
 
     <div class="footer">
       <div class="footer-options">
+        <label class="checkbox-label">
+          <input type="checkbox" id="desaturate-enabled" />
+          <span class="checkmark"></span>
+          Desaturate background
+        </label>
         <label class="checkbox-label">
           <input type="checkbox" id="per-monitor-focus" checked />
           <span class="checkmark"></span>

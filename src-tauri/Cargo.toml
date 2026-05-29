@@ -17,6 +17,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 
+# Matrix3x2 is not re-exported by the windows crate; it lives in
+# windows-numerics. cargo unifies this to the same 0.2.x the windows
+# crate already depends on, so no duplicate compile.
+windows-numerics = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
@@ -25,8 +30,26 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dwm",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
+    "Win32_Security",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Controls",
+    "Win32_UI_Magnification",
+    # --- blur prototype: capture + GPU blur pipeline ---
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectComposition",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Foundation",
+    "Foundation_Numerics",
 ] }
 
 [profile.release]

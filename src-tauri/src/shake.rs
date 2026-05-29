@@ -1,3 +1,4 @@
+use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -10,6 +11,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 static SHAKE_CALLBACK: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
+
+// The hook proc hands shake events to a worker thread through this
+// channel instead of running the toggle inline. A WH_MOUSE_LL hook proc
+// that runs longer than LowLevelHooksTimeout (~300ms) gets *silently
+// removed by Windows for the rest of the session* — and the toggle path
+// (update_overlay + Tauri emit) contends for the same locks the 16ms
+// foreground tracker holds, so running it on the hook thread is exactly
+// that trap. Sending on an unbounded channel is effectively instant, so
+// the hook proc always returns well under the timeout.
+static SHAKE_TX: Mutex<Option<Sender<()>>> = Mutex::new(None);
 
 struct ShakeState {
     last_x: i32,
@@ -60,9 +71,11 @@ unsafe extern "system" fn mouse_hook_proc(
                 if state.reversals >= SHAKE_REVERSALS_NEEDED {
                     state.reversals = 0;
                     drop(state_lock);
-                    if let Ok(cb) = SHAKE_CALLBACK.lock() {
-                        if let Some(ref f) = *cb {
-                            f();
+                    // Hand off to the worker thread and return immediately;
+                    // never run the toggle on the hook thread (see SHAKE_TX).
+                    if let Ok(tx) = SHAKE_TX.lock() {
+                        if let Some(ref sender) = *tx {
+                            let _ = sender.send(());
                         }
                     }
                     return CallNextHookEx(None, n_code, w_param, l_param);
@@ -82,6 +95,20 @@ pub fn start_detection<F: Fn() + Send + 'static>(on_shake: F) {
         let mut cb = SHAKE_CALLBACK.lock().unwrap();
         *cb = Some(Box::new(on_shake));
     }
+
+    // Worker thread that actually runs the toggle. The hook proc only
+    // signals it through the channel, keeping the hook proc fast enough
+    // to never trip LowLevelHooksTimeout.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    *SHAKE_TX.lock().unwrap() = Some(tx);
+    std::thread::spawn(move || {
+        while rx.recv().is_ok() {
+            let cb = SHAKE_CALLBACK.lock().unwrap();
+            if let Some(ref f) = *cb {
+                f();
+            }
+        }
+    });
 
     unsafe {
         let _hook = SetWindowsHookExW(
