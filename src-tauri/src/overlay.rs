@@ -838,13 +838,16 @@ unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
     let grain_hwnd = HWND(all_hwnds[GRAIN_IDX] as *mut _);
 
     // --- Tint window [10] ---
-    // The tint is now an HSL "Color" blend folded into the GPU blur pipeline
-    // (see gpu_blur::set_tint), which truly colorizes the background instead
-    // of the flat alpha-over a layered window can do. This window is retained
-    // only as a z-order anchor in the ownership chain, so force it fully
-    // transparent.
+    // The tint color is now an HSL "Color" blend folded into the GPU blur
+    // pipeline (see gpu_blur::set_tint), so this window contributes nothing
+    // visually. But it still doubles as the input catcher (no
+    // WS_EX_TRANSPARENT). Per MSDN, hit-testing on an LWA_ALPHA window uses
+    // its alpha: alpha=0 lets clicks pass straight through. Hold a 1/255
+    // floor while the overlay is visible so we always intercept clicks (the
+    // GPU does the real colorize, so this alpha is imperceptible).
+    let catcher_alpha = if fade > 0.0 { 1 } else { 0 };
     SetLayeredWindowAttributes(
-        tint_hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA,
+        tint_hwnd, windows::Win32::Foundation::COLORREF(0), catcher_alpha, LWA_ALPHA,
     ).ok();
     set_accent(tint_hwnd, ACCENT_DISABLED, 0);
 
