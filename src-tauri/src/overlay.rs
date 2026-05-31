@@ -1083,9 +1083,17 @@ fn foreground_tracker() {
 
     const TICK_MS: f64 = 16.0;
     let tick = std::time::Duration::from_millis(TICK_MS as u64);
+    // Animations advance by real elapsed time, not a fixed per-tick step.
+    // Windows' default timer granularity rounds thread::sleep(16ms) up to
+    // ~31ms, and heavy per-tick work adds more, so a fixed step made the
+    // fade run ~2x slower than its configured duration.
+    let mut last_tick = std::time::Instant::now();
 
     loop {
         std::thread::sleep(tick);
+        let now = std::time::Instant::now();
+        let dt_ms = now.duration_since(last_tick).as_secs_f64() * 1000.0;
+        last_tick = now;
 
         let hwnds: Vec<isize> = ALL_HWNDS.lock().unwrap().clone();
         if hwnds.is_empty() { continue; }
@@ -1095,7 +1103,7 @@ fn foreground_tracker() {
                 let mut fade = FADE.lock().unwrap();
                 if fade.animating {
                     let fade_ms = (*FADE_MS.lock().unwrap()).max(TICK_MS);
-                    let step = TICK_MS / fade_ms;
+                    let step = dt_ms / fade_ms;
                     if fade.target > fade.progress {
                         fade.progress = (fade.progress + step).min(fade.target);
                     } else {
@@ -1153,7 +1161,7 @@ fn foreground_tracker() {
                     // Fixed, snappy duration — independent of the (slower)
                     // activation fade. A mode switch should feel immediate.
                     const MODE_MS: f64 = 280.0;
-                    let step = TICK_MS / MODE_MS;
+                    let step = dt_ms / MODE_MS;
                     if mode.target > mode.progress {
                         mode.progress = (mode.progress + step).min(mode.target);
                     } else {
