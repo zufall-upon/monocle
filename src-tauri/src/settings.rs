@@ -30,6 +30,11 @@ pub struct AppSettings {
     #[serde(default)]
     pub app_wide_focus: bool,
     pub blur_taskbar: bool,
+    // Hide the desktop icons while Monocle is active (restored on deactivate).
+    // Driven through the shell's "Show desktop icons" toggle, not a registry
+    // edit, so it takes effect instantly and reverses cleanly.
+    #[serde(default)]
+    pub hide_desktop_icons: bool,
     pub start_on_login: bool,
 }
 
@@ -47,6 +52,7 @@ impl Default for AppSettings {
             per_monitor_focus: true,
             app_wide_focus: false,
             blur_taskbar: false,
+            hide_desktop_icons: false,
             start_on_login: false,
         }
     }

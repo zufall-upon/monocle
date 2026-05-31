@@ -30,6 +30,7 @@ function applySettingsToUI(s) {
   document.getElementById("per-monitor-focus").checked = s.per_monitor_focus;
   document.getElementById("app-wide-focus").checked = s.app_wide_focus;
   document.getElementById("blur-taskbar").checked = s.blur_taskbar;
+  document.getElementById("hide-desktop-icons").checked = s.hide_desktop_icons;
   document.getElementById("start-on-login").checked = s.start_on_login;
 
   // Reflect the current tint color in the single circle + the palette.
@@ -191,6 +192,12 @@ document.getElementById("app-wide-focus").addEventListener("change", (e) => {
 // Blur taskbar
 document.getElementById("blur-taskbar").addEventListener("change", (e) => {
   settings.blur_taskbar = e.target.checked;
+  saveSettings();
+});
+
+// Hide desktop icons
+document.getElementById("hide-desktop-icons").addEventListener("change", (e) => {
+  settings.hide_desktop_icons = e.target.checked;
   saveSettings();
 });
 

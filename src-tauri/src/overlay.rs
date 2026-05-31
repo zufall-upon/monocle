@@ -79,6 +79,13 @@ static BLUR_TASKBAR: AtomicBool = AtomicBool::new(false);
 // deactivation — or toggling the setting off mid-session — can restore the
 // taskbar to its normal topmost, crisp, clickable state.
 static TASKBAR_DEMOTED: AtomicBool = AtomicBool::new(false);
+// User setting: hide the desktop icons while Monocle is active.
+static HIDE_DESKTOP_ICONS: AtomicBool = AtomicBool::new(false);
+// True while WE have hidden the desktop icons. Tracks our own action so
+// deactivation (or toggling the setting off mid-session) only re-shows them
+// if we were the ones that hid them — we never force-show icons the user
+// had already hidden themselves.
+static ICONS_HIDDEN: AtomicBool = AtomicBool::new(false);
 // Crossfade duration in milliseconds. Live-updated from settings via
 // `update_overlay`. Clamped to >= 1 tick when read so a 0-duration
 // setting still converges instead of dividing by zero.
@@ -672,6 +679,53 @@ unsafe fn restore_taskbar() {
     }
 }
 
+/// Locate the desktop's `SHELLDLL_DefView` — the shell view that hosts the
+/// desktop icons and owns the "Show desktop icons" toggle command. Normally a
+/// direct child of `Progman`, but when a wallpaper slideshow / Spotlight is
+/// running the shell reparents it under a `WorkerW`, so fall back to scanning
+/// top-level windows for one with a `SHELLDLL_DefView` child.
+#[cfg(windows)]
+unsafe fn find_desktop_defview() -> Option<HWND> {
+    if let Ok(progman) = FindWindowW(windows::core::w!("Progman"), None) {
+        if let Ok(dv) = FindWindowExW(Some(progman), None, windows::core::w!("SHELLDLL_DefView"), None) {
+            if !dv.0.is_null() { return Some(dv); }
+        }
+    }
+    struct EnumState { result: isize }
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut EnumState);
+        if let Ok(dv) = FindWindowExW(Some(hwnd), None, windows::core::w!("SHELLDLL_DefView"), None) {
+            if !dv.0.is_null() { state.result = dv.0 as isize; return BOOL(0); }
+        }
+        BOOL(1)
+    }
+    let mut state = EnumState { result: 0 };
+    let _ = EnumWindows(Some(callback), LPARAM(&mut state as *mut EnumState as isize));
+    if state.result != 0 { Some(HWND(state.result as *mut _)) } else { None }
+}
+
+/// Show or hide the desktop icons by toggling the icon list view directly with
+/// `ShowWindow`. This is deliberately NOT the shell's 0x7402 "Show desktop
+/// icons" command: that command flips a *persistent* user setting and plays
+/// Explorer's ~1s fade-in animation on show. ShowWindow is instant in both
+/// directions and leaves the persistent setting alone, so if Monocle ever dies
+/// mid-session Explorer just repaints the icons rather than leaving them stuck
+/// hidden. The per-tick reassert in the tracker re-hides them if Explorer
+/// repaints while we want them gone. Idempotent: only acts when the list view's
+/// current visibility differs from `show`.
+#[cfg(windows)]
+unsafe fn set_desktop_icons(show: bool) {
+    let Some(defview) = find_desktop_defview() else { return };
+    // The SysListView32 child is the actual icon grid; its visibility is the
+    // ground truth for whether icons are currently shown.
+    let listview = match FindWindowExW(Some(defview), None, windows::core::w!("SysListView32"), None) {
+        Ok(lv) if !lv.0.is_null() => lv,
+        _ => return,
+    };
+    if IsWindowVisible(listview).as_bool() == show { return; }
+    let _ = ShowWindow(listview, if show { SW_SHOW } else { SW_HIDE });
+}
+
 /// Walk the GW_OWNER chain to the top (the "root owner" of a window).
 /// For an unowned top-level window this returns the window itself; for
 /// an owned popup/dialog it returns its top-level owner.
@@ -1143,6 +1197,12 @@ fn foreground_tracker() {
                             if TASKBAR_DEMOTED.swap(false, Ordering::Relaxed) {
                                 restore_taskbar();
                             }
+                            // Bring desktop icons back once the overlay has
+                            // fully faded out, so they reappear with the
+                            // background rather than popping in early.
+                            if ICONS_HIDDEN.swap(false, Ordering::Relaxed) {
+                                set_desktop_icons(true);
+                            }
                             // Clear the focus rects so the GPU blur stops
                             // neutralizing any window region once we're off.
                             crate::gpu_blur::set_focus_rects(&[]);
@@ -1205,6 +1265,16 @@ fn foreground_tracker() {
                 TASKBAR_DEMOTED.store(true, Ordering::Relaxed);
             } else if TASKBAR_DEMOTED.swap(false, Ordering::Relaxed) {
                 restore_taskbar();
+            }
+
+            // Desktop icons: hide them while active, or re-show them if the
+            // setting was toggled off mid-session. set_desktop_icons is
+            // idempotent so re-asserting each tick is cheap.
+            if HIDE_DESKTOP_ICONS.load(Ordering::Relaxed) {
+                set_desktop_icons(false);
+                ICONS_HIDDEN.store(true, Ordering::Relaxed);
+            } else if ICONS_HIDDEN.swap(false, Ordering::Relaxed) {
+                set_desktop_icons(true);
             }
 
             // Keep our settings window above the overlay (and everything else)
@@ -1634,6 +1704,7 @@ pub fn update_overlay(settings: &AppSettings, active: bool) {
         NEEDS_INITIAL_SETUP.store(true, Ordering::Relaxed);
     }
     BLUR_TASKBAR.store(settings.blur_taskbar, Ordering::Relaxed);
+    HIDE_DESKTOP_ICONS.store(settings.hide_desktop_icons, Ordering::Relaxed);
     *FADE_MS.lock().unwrap() = settings.fade_duration_secs * 1000.0;
 
     let (r, g, b) = parse_hex_color(&settings.tint_color);
