@@ -209,6 +209,12 @@ pub fn run() {
             // Maps to SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) on Windows.
             if let Some(settings_win) = app.get_webview_window("settings") {
                 let _ = settings_win.set_content_protected(true);
+                // Register its HWND so the overlay keeps it above the blur and
+                // excludes it from all focus/z-order mechanics.
+                #[cfg(windows)]
+                if let Ok(hwnd) = settings_win.hwnd() {
+                    overlay::register_settings_window(hwnd.0 as isize);
+                }
             }
 
             // Blur prototype test panels remain available from the tray

@@ -28,6 +28,7 @@ function applySettingsToUI(s) {
 
   document.getElementById("desaturate-enabled").checked = s.desaturate_enabled;
   document.getElementById("per-monitor-focus").checked = s.per_monitor_focus;
+  document.getElementById("app-wide-focus").checked = s.app_wide_focus;
   document.getElementById("blur-taskbar").checked = s.blur_taskbar;
   document.getElementById("start-on-login").checked = s.start_on_login;
 
@@ -178,6 +179,12 @@ document.getElementById("desaturate-enabled").addEventListener("change", (e) => 
 // Per-monitor focus
 document.getElementById("per-monitor-focus").addEventListener("change", (e) => {
   settings.per_monitor_focus = e.target.checked;
+  saveSettings();
+});
+
+// App-wide focus
+document.getElementById("app-wide-focus").addEventListener("change", (e) => {
+  settings.app_wide_focus = e.target.checked;
   saveSettings();
 });
 

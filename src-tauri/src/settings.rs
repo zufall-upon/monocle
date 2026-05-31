@@ -24,6 +24,11 @@ pub struct AppSettings {
     #[serde(default = "default_fade_duration_secs")]
     pub fade_duration_secs: f64,
     pub per_monitor_focus: bool,
+    // When true, focusing a window keeps every window of that same
+    // application sharp (not just the active one). Interacts with
+    // per_monitor_focus: see `focused_group` in overlay.rs.
+    #[serde(default)]
+    pub app_wide_focus: bool,
     pub blur_taskbar: bool,
     pub start_on_login: bool,
 }
@@ -40,6 +45,7 @@ impl Default for AppSettings {
             shake_sensitivity: 0.5,
             fade_duration_secs: default_fade_duration_secs(),
             per_monitor_focus: true,
+            app_wide_focus: false,
             blur_taskbar: false,
             start_on_login: false,
         }

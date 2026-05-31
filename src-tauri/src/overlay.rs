@@ -1,6 +1,6 @@
 use crate::settings::AppSettings;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 #[cfg(windows)]
@@ -64,7 +64,15 @@ static PUSHED_DOWN: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 const MAX_PUSHED: usize = 256;
 
 static OVERLAY_PER_MONITOR: AtomicBool = AtomicBool::new(true);
+// When true, a focus anchor sharpens its whole application (every window of
+// the same process), not just the active window + its owner-chain popups.
+static APP_WIDE_FOCUS: AtomicBool = AtomicBool::new(false);
 static NEEDS_INITIAL_SETUP: AtomicBool = AtomicBool::new(false);
+// HWND of our own settings window. It's excluded from all focus/z-order
+// mechanics (never an anchor, group member, or demote target) and instead
+// kept above the overlay every tick, so it stays usable for tuning no matter
+// what else is focused. 0 until registered at startup.
+static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 static BLUR_TASKBAR: AtomicBool = AtomicBool::new(false);
 // True while the taskbar has been demoted out of the topmost band and pushed
 // below the overlay so the GPU blur composites over it. Tracks demotion so
@@ -538,6 +546,11 @@ fn is_eligible_window(hwnd: HWND, all_hwnds: &[isize]) -> bool {
     unsafe {
         let hwnd_val = hwnd.0 as isize;
         if hwnd_val == 0 || all_hwnds.contains(&hwnd_val) { return false; }
+        // Our settings window is never part of focus mechanics — it floats
+        // above the overlay on its own (see SETTINGS_HWND handling in the
+        // tracker), so it must never be an anchor, group member, or demote
+        // target.
+        if hwnd_val == SETTINGS_HWND.load(Ordering::Relaxed) { return false; }
         if !IsWindowVisible(hwnd).as_bool() { return false; }
         if should_skip_window(hwnd) { return false; }
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
@@ -576,19 +589,23 @@ unsafe fn push_below_overlay(target: HWND, root_overlay: HWND) {
     }
 }
 
-/// Iterate every still-living window we pushed below root and bring
-/// each to the top. Oldest-pushed first so the most-recently-deprioritized
-/// window ends up nearest the top (mimics LRU recency).
+/// Every eligible top-level window, in z-order top-to-bottom (the order
+/// EnumWindows yields). This is the activation snapshot: the initial-setup
+/// pass splits it into a sharp block and a blurred block, re-stacking each
+/// without changing any window's position relative to the others.
 #[cfg(windows)]
-unsafe fn restore_pushed_windows() {
-    let mut pushed = PUSHED_DOWN.lock().unwrap();
-    for &hwnd_val in pushed.iter() {
-        let hwnd = HWND(hwnd_val as *mut _);
-        if IsWindow(Some(hwnd)).as_bool() {
-            let _ = BringWindowToTop(hwnd);
+fn enumerate_eligible_in_z_order(all_hwnds: &[isize]) -> Vec<isize> {
+    struct EnumState { all_hwnds: Vec<isize>, result: Vec<isize> }
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut EnumState);
+        if is_eligible_window(hwnd, &state.all_hwnds) {
+            state.result.push(hwnd.0 as isize);
         }
+        BOOL(1)
     }
-    pushed.clear();
+    let mut state = EnumState { all_hwnds: all_hwnds.to_vec(), result: Vec::new() };
+    unsafe { let _ = EnumWindows(Some(callback), LPARAM(&mut state as *mut EnumState as isize)); }
+    state.result
 }
 
 /// Every taskbar window across all monitors: the primary `Shell_TrayWnd` plus
@@ -655,21 +672,6 @@ unsafe fn restore_taskbar() {
     }
 }
 
-#[cfg(windows)]
-fn find_top_window_per_monitor(all_hwnds: &[isize]) -> HashMap<isize, isize> {
-    struct EnumState { all_hwnds: Vec<isize>, result: HashMap<isize, isize> }
-    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let state = &mut *(lparam.0 as *mut EnumState);
-        if !is_eligible_window(hwnd, &state.all_hwnds) { return BOOL(1); }
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        state.result.entry(monitor.0 as isize).or_insert(hwnd.0 as isize);
-        BOOL(1)
-    }
-    let mut state = EnumState { all_hwnds: all_hwnds.to_vec(), result: HashMap::new() };
-    unsafe { let _ = EnumWindows(Some(callback), LPARAM(&mut state as *mut EnumState as isize)); }
-    state.result
-}
-
 /// Walk the GW_OWNER chain to the top (the "root owner" of a window).
 /// For an unowned top-level window this returns the window itself; for
 /// an owned popup/dialog it returns its top-level owner.
@@ -680,6 +682,27 @@ unsafe fn root_owner(hwnd: HWND) -> HWND {
         match GetWindow(cur, GW_OWNER) {
             Ok(o) if !o.0.is_null() => cur = o,
             _ => return cur,
+        }
+    }
+}
+
+/// True if `w` sits above `root_overlay` in global z-order (i.e. it's sharp,
+/// not behind the blur). Walks downward from `w`; reaching the overlay root
+/// before the end of the chain means `w` is above it. Used to skip re-raising
+/// windows that are already correctly placed — gratuitous SetWindowPos calls
+/// on the unfocused monitor cause visible flicker.
+#[cfg(windows)]
+unsafe fn is_above_overlay(w: HWND, root_overlay: HWND) -> bool {
+    let mut cur = w;
+    loop {
+        match GetWindow(cur, GW_HWNDNEXT) {
+            Ok(next) if !next.0.is_null() => {
+                if next.0 == root_overlay.0 {
+                    return true;
+                }
+                cur = next;
+            }
+            _ => return false,
         }
     }
 }
@@ -724,6 +747,80 @@ fn fg_app_group(fg: HWND, all_hwnds: &[isize]) -> Vec<isize> {
         state.result.push(fg_val);
     }
     state.result
+}
+
+/// Every eligible top-level window belonging to `anchor`'s process. When
+/// `monitor_scope` is `Some(m)`, restrict to windows on monitor `m`; when
+/// `None`, span all monitors. This is the app-wide expansion: instead of
+/// just the active window, keep the whole application sharp.
+#[cfg(windows)]
+fn app_process_group(
+    anchor: HWND,
+    all_hwnds: &[isize],
+    monitor_scope: Option<isize>,
+) -> Vec<isize> {
+    let mut anchor_pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(anchor, Some(&mut anchor_pid)); }
+    if anchor_pid == 0 {
+        // No process id — fall back to the owner-chain group so we never
+        // strand the anchor unfocused.
+        return fg_app_group(anchor, all_hwnds);
+    }
+
+    struct EnumState {
+        all_hwnds: Vec<isize>,
+        pid: u32,
+        monitor_scope: Option<isize>,
+        result: Vec<isize>,
+    }
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut EnumState);
+        if !is_eligible_window(hwnd, &state.all_hwnds) { return BOOL(1); }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != state.pid { return BOOL(1); }
+        if let Some(m) = state.monitor_scope {
+            let win_mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST).0 as isize;
+            if win_mon != m { return BOOL(1); }
+        }
+        state.result.push(hwnd.0 as isize);
+        BOOL(1)
+    }
+
+    let mut state = EnumState {
+        all_hwnds: all_hwnds.to_vec(),
+        pid: anchor_pid,
+        monitor_scope,
+        result: Vec::new(),
+    };
+    unsafe { let _ = EnumWindows(Some(callback), LPARAM(&mut state as *mut EnumState as isize)); }
+    // Guarantee the anchor itself is present even if it momentarily failed an
+    // eligibility check (e.g. mid-resize, transiently zero-sized).
+    let anchor_val = anchor.0 as isize;
+    if !state.result.contains(&anchor_val) {
+        state.result.push(anchor_val);
+    }
+    state.result
+}
+
+/// The set of windows to keep sharp for a focus `anchor` on `monitor`.
+/// Without app-wide focus this is the anchor's owner-chain group (the active
+/// window plus its popups/dialogs) — identical to the prior behavior. With
+/// app-wide focus on, it expands to the anchor's whole process, scoped to
+/// `monitor` when per-monitor focus is on (so each monitor keeps only its own
+/// copy of the app sharp — e.g. Figma sharp on the left while a Chrome window
+/// on the same monitor stays blurred) or spanning all monitors when off.
+#[cfg(windows)]
+fn focused_group(anchor: HWND, all_hwnds: &[isize], monitor: isize) -> Vec<isize> {
+    if !APP_WIDE_FOCUS.load(Ordering::Relaxed) {
+        return fg_app_group(anchor, all_hwnds);
+    }
+    let scope = if OVERLAY_PER_MONITOR.load(Ordering::Relaxed) {
+        Some(monitor)
+    } else {
+        None
+    };
+    app_process_group(anchor, all_hwnds, scope)
 }
 
 /// Find the topmost eligible window underneath the overlay at a screen
@@ -878,6 +975,16 @@ unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
 
 // --- Overlay ---
 
+/// Register our own settings window so the focus engine can keep it above the
+/// overlay and out of the blur/z-order mechanics. Called once at startup.
+#[cfg(windows)]
+pub fn register_settings_window(hwnd: isize) {
+    SETTINGS_HWND.store(hwnd, Ordering::Relaxed);
+}
+
+#[cfg(not(windows))]
+pub fn register_settings_window(_hwnd: isize) {}
+
 #[cfg(windows)]
 pub fn init() {
     load_composition_api();
@@ -1014,10 +1121,14 @@ fn foreground_tracker() {
                                 set_accent(hwnd, ACCENT_DISABLED, 0);
                                 let _ = ShowWindow(hwnd, SW_HIDE);
                             }
-                            // Release every window we pushed below root during
-                            // this active session. Hiding the overlay alone
-                            // leaves them stuck at the bottom of z-order.
-                            restore_pushed_windows();
+                            // Just hide the overlay — don't touch any window's
+                            // z-order. Activation kept every window in its
+                            // original relative order with the overlay slotted
+                            // in as a divider, so hiding it closes the gap and
+                            // the windows are left exactly where the user last
+                            // had them. Forcibly raising the blurred windows
+                            // here is what made them reshuffle on deactivate.
+                            PUSHED_DOWN.lock().unwrap().clear();
                             // If we demoted the taskbar to blur it, lift it
                             // back into the topmost band so it's crisp and
                             // clickable again now that Monocle is off.
@@ -1088,40 +1199,131 @@ fn foreground_tracker() {
                 restore_taskbar();
             }
 
+            // Keep our settings window above the overlay (and everything else)
+            // every tick so it's always usable for tuning while Monocle is
+            // active, regardless of which app the user focuses. It's excluded
+            // from the focus engine entirely (is_eligible_window rejects it),
+            // so this is the only thing that positions it.
+            let settings_val = SETTINGS_HWND.load(Ordering::Relaxed);
+            if settings_val != 0 {
+                let sw = HWND(settings_val as *mut _);
+                if IsWindowVisible(sw).as_bool() {
+                    let _ = SetWindowPos(
+                        sw, Some(HWND_TOP), 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+
             if NEEDS_INITIAL_SETUP.swap(false, Ordering::Relaxed) {
+                let root_overlay = HWND(hwnds[0] as *mut _);
                 monitor_focused.clear();
-                let top_windows = find_top_window_per_monitor(&hwnds);
-                let fg = GetForegroundWindow();
-                let fg_val = fg.0 as isize;
-                // Never anchor against a topmost/shell foreground (e.g. the
-                // tray flyout we activate from): inserting after it makes the
-                // moved window topmost. Fall back to HWND_TOP — top of the
-                // non-topmost band — which is where these belong anyway.
-                let anchor = if fg_val != 0
-                    && !is_overlay(fg_val)
-                    && !should_skip_window(fg)
-                {
-                    fg
-                } else { HWND_TOP };
-                for (&mon, &hw) in &top_windows {
-                    let group = fg_app_group(HWND(hw as *mut _), &hwnds);
+
+                // Snapshot every eligible window once, top-to-bottom in z-order.
+                // This is the ground truth we re-stack against — we never invent
+                // a new ordering, we only split it into "sharp" (stays above the
+                // overlay) and "blurred" (drops below) while preserving each
+                // window's position relative to the others.
+                let z_ordered = enumerate_eligible_in_z_order(&hwnds);
+                let per_monitor = OVERLAY_PER_MONITOR.load(Ordering::Relaxed);
+
+                // Decide which windows stay sharp.
+                //   * per-monitor on: each monitor's topmost window, expanded to
+                //     its focus group (owner-chain, or the whole app on that
+                //     monitor when app-wide focus is on).
+                //   * per-monitor off: a single global group — the topmost
+                //     window overall and its focus group.
+                let mut sharp_set: std::collections::HashSet<isize> =
+                    std::collections::HashSet::new();
+                if per_monitor {
+                    let mut seen: std::collections::HashSet<isize> =
+                        std::collections::HashSet::new();
+                    for &w in &z_ordered {
+                        let mon = MonitorFromWindow(
+                            HWND(w as *mut _), MONITOR_DEFAULTTONEAREST,
+                        ).0 as isize;
+                        if !seen.insert(mon) { continue; }
+                        let group = focused_group(HWND(w as *mut _), &hwnds, mon);
+                        for &g in &group { sharp_set.insert(g); }
+                        monitor_focused.insert(mon, group);
+                    }
+                } else if let Some(&top) = z_ordered.first() {
+                    let mon = MonitorFromWindow(
+                        HWND(top as *mut _), MONITOR_DEFAULTTONEAREST,
+                    ).0 as isize;
+                    let group = focused_group(HWND(top as *mut _), &hwnds, mon);
+                    for &g in &group { sharp_set.insert(g); }
                     monitor_focused.insert(mon, group);
-                    if hw != fg_val {
-                        let _ = SetWindowPos(HWND(hw as *mut _), Some(anchor), 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                }
+
+                // The sharp windows in their existing relative z-order. No window
+                // ever moves relative to another — we lift this whole block above
+                // the overlay as a unit, so the user never sees them reshuffle.
+                let sharp_ordered: Vec<isize> = z_ordered
+                    .iter().copied().filter(|h| sharp_set.contains(h)).collect();
+
+                // 1. Chain the sharp windows at the very top, preserving order.
+                let mut prev = HWND_TOP;
+                for &w in &sharp_ordered {
+                    let hw = HWND(w as *mut _);
+                    let _ = SetWindowPos(
+                        hw, Some(prev), 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                    prev = hw;
+                }
+
+                // 2. Slide the whole overlay directly beneath the last sharp
+                //    window. The owner→owned chain keeps grain/tint/blur stacked
+                //    just above root, so moving root drags the entire overlay
+                //    into the slot below the sharp block. With nothing sharp,
+                //    park it at the top so the blur covers everything.
+                let overlay_anchor =
+                    if sharp_ordered.is_empty() { HWND_TOP } else { prev };
+                let _ = SetWindowPos(
+                    root_overlay, Some(overlay_anchor), 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+
+                // 3. Drop every blurred window directly below the overlay, in
+                //    its existing relative order, and record it so deactivation
+                //    can restore it.
+                {
+                    let mut pushed = PUSHED_DOWN.lock().unwrap();
+                    let mut prev_below = root_overlay;
+                    for &w in &z_ordered {
+                        if sharp_set.contains(&w) { continue; }
+                        let hw = HWND(w as *mut _);
+                        let _ = SetWindowPos(
+                            hw, Some(prev_below), 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                        prev_below = hw;
+                        pushed.retain(|&h| h != w);
+                        pushed.push(w);
+                    }
+                    if pushed.len() > MAX_PUSHED {
+                        let drop_count = pushed.len() - MAX_PUSHED;
+                        pushed.drain(..drop_count);
                     }
                 }
-                // Keep taskbar above overlay on initial setup — unless the
-                // user opted to blur it, in which case the per-tick demote
-                // above pushes it below the overlay to be blurred instead.
+
+                // Re-pin the GPU blur windows above the top blur placeholder now
+                // that the overlay stack moved.
+                crate::gpu_blur::reassert_z(hwnds[BLUR_LAYERS - 1]);
+
+                // Keep the taskbar above the overlay unless the user opted to
+                // blur it (the per-tick demote handles that case).
                 if !BLUR_TASKBAR.load(Ordering::Relaxed) {
-                    if let Ok(tb) = FindWindowW(windows::core::w!("Shell_TrayWnd"), None) {
-                        let _ = SetWindowPos(tb, Some(anchor), 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-                    }
-                    if let Ok(tb2) = FindWindowW(windows::core::w!("Shell_SecondaryTrayWnd"), None) {
-                        let _ = SetWindowPos(tb2, Some(anchor), 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                    for tb_val in all_taskbar_hwnds() {
+                        let _ = SetWindowPos(
+                            HWND(tb_val as *mut _), Some(HWND_TOP), 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
                     }
                 }
-                last_fg = fg_val;
+
+                last_fg = GetForegroundWindow().0 as isize;
                 continue;
             }
 
@@ -1129,6 +1331,12 @@ fn foreground_tracker() {
             let fg_val = fg.0 as isize;
             if fg_val == 0 || is_overlay(fg_val) { continue; }
             if should_skip_window(fg) { continue; }
+            // Our settings window is outside the focus engine: focusing it must
+            // not recompute groups or push the user's real app behind the
+            // overlay. It's kept above the overlay by the per-tick raise above,
+            // and last_fg is left untouched so returning to the real app still
+            // registers as a foreground change.
+            if fg_val == SETTINGS_HWND.load(Ordering::Relaxed) { continue; }
 
             // Ignore foreground changes to transient/helper windows.
             // Tray icons (ours and any other app's) work by calling
@@ -1140,8 +1348,7 @@ fn foreground_tracker() {
             // blurred. These helpers are invisible / cloaked / zero-
             // sized, so the real-app gate catches them regardless of
             // which process owns them — including our own tray helper.
-            // Our visible settings window passes the gate and IS a real
-            // FG the user wants promoted above the overlay.
+            // (Our settings window is handled separately above.)
             if !looks_like_real_app_window(fg) {
                 continue;
             }
@@ -1190,7 +1397,7 @@ fn foreground_tracker() {
                                     0, 0, 0, 0,
                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                                 );
-                                let next_group = fg_app_group(HWND(next_hw as *mut _), &hwnds);
+                                let next_group = focused_group(HWND(next_hw as *mut _), &hwnds, *old_mon);
                                 monitor_focused.insert(*old_mon, next_group);
                             }
                         }
@@ -1204,7 +1411,7 @@ fn foreground_tracker() {
 
             let monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
             let monitor_key = monitor.0 as isize;
-            let new_group = fg_app_group(fg, &hwnds);
+            let new_group = focused_group(fg, &hwnds, monitor_key);
 
             // Push down only what *left* the un-blurred set — windows
             // that were in the previous group but aren't part of the
@@ -1242,16 +1449,19 @@ fn foreground_tracker() {
                 !v.is_empty()
             });
 
-            // Re-assert the cross-monitor invariant. A single overlay spans
-            // every monitor, but per-monitor focus needs one window *per
-            // monitor* sitting above that overlay simultaneously. Pushing
-            // the departed window down only fixes the monitor we just
-            // touched; the OTHER monitor's focused window routinely gets
-            // stranded behind the overlay when the OS reshuffles z-order on
-            // a click. So after every focus change, lift every tracked
-            // focused group back above the overlay. The current
-            // foreground's monitor is raised last so it ends up genuinely
-            // on top.
+            // Re-assert which windows sit above the overlay. A single overlay
+            // spans every monitor, so per-monitor focus needs one focused
+            // group per monitor sharp simultaneously, and app-wide focus needs
+            // every window of the focused app sharp.
+            //
+            // Two rules keep this correct without thrashing z-order:
+            //   * Other monitors: only lift a group member that has actually
+            //     fallen behind the overlay. Re-raising already-sharp windows
+            //     on the unfocused monitor is what caused the visible flicker.
+            //   * Current monitor: the OS click already put the fg on top, so
+            //     tuck its app-wide siblings in *behind* the fg (not at
+            //     HWND_TOP) — otherwise a sibling lands on top and the window
+            //     the user actually clicked isn't the one in front.
             if per_monitor {
                 for (&mon, group) in monitor_focused.iter() {
                     if mon == monitor_key {
@@ -1259,7 +1469,9 @@ fn foreground_tracker() {
                     }
                     for &w in group {
                         let hw = HWND(w as *mut _);
-                        if IsWindow(Some(hw)).as_bool() {
+                        if IsWindow(Some(hw)).as_bool()
+                            && !is_above_overlay(hw, root_overlay)
+                        {
                             let _ = SetWindowPos(
                                 hw, Some(HWND_TOP), 0, 0, 0, 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
@@ -1267,15 +1479,24 @@ fn foreground_tracker() {
                         }
                     }
                 }
-                if let Some(group) = monitor_focused.get(&monitor_key) {
-                    for &w in group {
-                        let hw = HWND(w as *mut _);
-                        if IsWindow(Some(hw)).as_bool() {
-                            let _ = SetWindowPos(
-                                hw, Some(HWND_TOP), 0, 0, 0, 0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                            );
-                        }
+            }
+            if let Some(group) = monitor_focused.get(&monitor_key) {
+                for &w in group {
+                    if w == fg_val { continue; }
+                    let hw = HWND(w as *mut _);
+                    // Only lift a sibling that has actually fallen behind the
+                    // overlay. Re-inserting an already-sharp sibling behind fg
+                    // would reorder it relative to its peers — visible as the
+                    // app's other windows reshuffling when one opens or gains
+                    // focus. Leaving sharp windows untouched preserves the
+                    // z-order they had when Monocle turned on.
+                    if IsWindow(Some(hw)).as_bool()
+                        && !is_above_overlay(hw, root_overlay)
+                    {
+                        let _ = SetWindowPos(
+                            hw, Some(fg), 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
                     }
                 }
             }
@@ -1390,7 +1611,20 @@ unsafe extern "system" fn overlay_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
 #[cfg(windows)]
 pub fn update_overlay(settings: &AppSettings, active: bool) {
     let was_active = OVERLAY_ACTIVE.swap(active, Ordering::Relaxed);
-    OVERLAY_PER_MONITOR.store(settings.per_monitor_focus, Ordering::Relaxed);
+    let prev_per_monitor = OVERLAY_PER_MONITOR.swap(settings.per_monitor_focus, Ordering::Relaxed);
+    let prev_app_wide = APP_WIDE_FOCUS.swap(settings.app_wide_focus, Ordering::Relaxed);
+    // A change to either focus-model toggle redefines which windows should be
+    // sharp, but the tracker only recomputes groups on a foreground change.
+    // When such a toggle flips while the overlay is already up, force a fresh
+    // focus pass so the new model takes effect immediately instead of waiting
+    // for the user to click another window. Gated on an actual value change so
+    // ordinary updates (slider drags, color picks) don't reshuffle z-order.
+    if active
+        && (prev_per_monitor != settings.per_monitor_focus
+            || prev_app_wide != settings.app_wide_focus)
+    {
+        NEEDS_INITIAL_SETUP.store(true, Ordering::Relaxed);
+    }
     BLUR_TASKBAR.store(settings.blur_taskbar, Ordering::Relaxed);
     *FADE_MS.lock().unwrap() = settings.fade_duration_secs * 1000.0;
 
