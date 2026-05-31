@@ -11,6 +11,13 @@ async function init() {
   listen("monocle-toggled", (event) => {
     updateStatusUI(event.payload);
   });
+
+  // The mode-switch hotkey changes settings from outside this window;
+  // re-apply so the blur-mode toggle stays in sync.
+  listen("settings-updated", (event) => {
+    settings = event.payload;
+    applySettingsToUI(settings);
+  });
 }
 
 function applySettingsToUI(s) {
@@ -32,6 +39,12 @@ function applySettingsToUI(s) {
   document.getElementById("blur-taskbar").checked = s.blur_taskbar;
   document.getElementById("hide-desktop-icons").checked = s.hide_desktop_icons;
   document.getElementById("start-on-login").checked = s.start_on_login;
+
+  // Document the active global hotkeys in the Shortcuts section.
+  const fmt = (spec) => (spec || "").replace(/\+/g, " + ");
+  document.getElementById("sc-toggle").textContent = fmt(s.toggle_shortcut);
+  document.getElementById("sc-mode").textContent = fmt(s.mode_shortcut);
+  document.getElementById("sc-settings").textContent = fmt(s.settings_shortcut);
 
   // Reflect the current tint color in the single circle + the palette.
   document.getElementById("swatch-current").style.background = s.tint_color;

@@ -1838,19 +1838,23 @@ fn smootherstep(x: f64) -> f64 {
     x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
 }
 
-/// Direction-aware easing applied to the linear `fade.progress` so the
-/// visual response is asymmetric: fade-in eases at both ends
-/// (smootherstep) while fade-out releases immediately then settles into
-/// transparent (cubic ease-out). Symmetric easing on fade-out makes the
-/// overlay feel like it lingers before letting go.
+/// Direction-aware easing applied to the linear `fade.progress`. Both
+/// directions use a cubic ease-out so the response is immediate on each
+/// edge and then settles gently — fade-in and fade-out feel symmetric.
+/// Fade-in previously used smootherstep, whose zero initial slope made the
+/// first ~150ms of a 0.75s fade nearly invisible; that flat onset read as a
+/// dead pause between pressing the toggle and the overlay appearing.
 fn ease_for_target(progress: f64, target: f64) -> f64 {
+    let p = progress.clamp(0.0, 1.0);
     if target > 0.5 {
-        smootherstep(progress)
+        // Fade-in: cubic ease-out, alpha = 1 − (1−p)³. Non-zero initial
+        // slope (3) so the overlay starts rising the instant the fade does.
+        let inv = 1.0 - p;
+        1.0 - inv * inv * inv
     } else {
-        // Cubic ease-out expressed in terms of the *progress* value
-        // (which decreases from 1→0 during fade-out): alpha = p³.
-        // At p=0.9 → 0.729 (a fast initial drop), at p=0.1 → 0.001.
-        let p = progress.clamp(0.0, 1.0);
+        // Fade-out: cubic ease-out on the *progress* value (which decreases
+        // from 1→0 during fade-out): alpha = p³. At p=0.9 → 0.729 (a fast
+        // initial drop), at p=0.1 → 0.001.
         p * p * p
     }
 }

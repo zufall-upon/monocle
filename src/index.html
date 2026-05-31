@@ -130,39 +130,64 @@
     </div>
 
     <div class="footer">
-      <div class="footer-options">
-        <label class="checkbox-label">
-          <input type="checkbox" id="desaturate-enabled" />
-          <span class="checkmark"></span>
-          Mono
-        </label>
-        <label class="checkbox-label">
-          <input type="checkbox" id="per-monitor-focus" checked />
-          <span class="checkmark"></span>
-          Per-monitor focus
-        </label>
-        <label class="checkbox-label">
-          <input type="checkbox" id="app-wide-focus" />
-          <span class="checkmark"></span>
-          App-wide focus
-        </label>
-        <label class="checkbox-label">
-          <input type="checkbox" id="blur-taskbar" />
-          <span class="checkmark"></span>
-          Auto-hide taskbar
-        </label>
-        <label class="checkbox-label">
-          <input type="checkbox" id="hide-desktop-icons" />
-          <span class="checkmark"></span>
-          Hide desktop icons
-        </label>
+      <div class="footer-section">
+        <div class="footer-options">
+          <label class="checkbox-label">
+            <input type="checkbox" id="desaturate-enabled" />
+            <span class="checkmark"></span>
+            Mono
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" id="per-monitor-focus" checked />
+            <span class="checkmark"></span>
+            Per-monitor focus
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" id="app-wide-focus" />
+            <span class="checkmark"></span>
+            App-wide focus
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" id="blur-taskbar" />
+            <span class="checkmark"></span>
+            Auto-hide taskbar
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" id="hide-desktop-icons" />
+            <span class="checkmark"></span>
+            Hide desktop icons
+          </label>
+        </div>
+      </div>
+
+      <div class="footer-section">
+        <div class="footer-section-title">Shortcuts</div>
+        <div class="shortcut-row">
+          <span class="shortcut-name">Toggle Monocle</span>
+          <span class="kbd" id="sc-toggle">Ctrl + Alt + Win + F</span>
+        </div>
+        <div class="shortcut-row">
+          <span class="shortcut-name">Switch blur mode</span>
+          <span class="kbd" id="sc-mode">Ctrl + Alt + Win + M</span>
+        </div>
+        <div class="shortcut-row">
+          <span class="shortcut-name">Settings window</span>
+          <span class="kbd" id="sc-settings">Ctrl + Alt + Win + C</span>
+        </div>
+      </div>
+
+      <div class="footer-section">
         <label class="checkbox-label">
           <input type="checkbox" id="start-on-login" />
           <span class="checkmark"></span>
           Start on login
         </label>
+        <div class="about">
+          <span class="about-name">Monocle</span>
+          <span class="version">v0.1.0</span>
+          <span class="copyright">© 2026 Bryce Lewis</span>
+        </div>
       </div>
-      <span class="version">v0.1.0</span>
     </div>
   </div>
 

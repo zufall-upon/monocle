@@ -1,7 +1,6 @@
 //! Production GPU blur layer.
 //!
-//! This is the prototype from `blur_proto.rs` promoted into the real
-//! overlay stack. Per monitor it stands up a DirectComposition window
+//! Per monitor it stands up a DirectComposition window
 //! that captures that monitor (Windows.Graphics.Capture), runs the
 //! captured frame through a Direct2D Saturation -> Gaussian effect chain,
 //! and presents the result. It replaces the old acrylic blur layers and

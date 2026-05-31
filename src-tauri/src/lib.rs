@@ -1,4 +1,3 @@
-mod blur_proto;
 mod gpu_blur;
 mod magnifier;
 mod overlay;
@@ -7,17 +6,24 @@ mod shake;
 mod windows_api;
 
 use settings::AppSettings;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
+use tauri_plugin_global_shortcut::{
+    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub settings: Arc<Mutex<AppSettings>>,
     pub active: Arc<Mutex<bool>>,
+    // The global hotkeys currently registered. Held so we can unregister them
+    // before rebinding when any shortcut setting changes.
+    pub shortcuts: Arc<Mutex<Vec<Shortcut>>>,
 }
 
 #[tauri::command]
@@ -26,11 +32,145 @@ fn get_settings(state: tauri::State<AppState>) -> AppSettings {
 }
 
 #[tauri::command]
-fn update_settings(state: tauri::State<AppState>, new_settings: AppSettings) {
-    let mut s = state.settings.lock().unwrap();
-    *s = new_settings.clone();
-    s.save();
+fn update_settings(app: tauri::AppHandle, state: tauri::State<AppState>, new_settings: AppSettings) {
+    let shortcuts_changed = {
+        let mut s = state.settings.lock().unwrap();
+        let changed = s.toggle_shortcut != new_settings.toggle_shortcut
+            || s.mode_shortcut != new_settings.mode_shortcut
+            || s.settings_shortcut != new_settings.settings_shortcut;
+        *s = new_settings.clone();
+        s.save();
+        changed
+    };
     overlay::update_overlay(&new_settings, *state.active.lock().unwrap());
+    // Rebind the global hotkeys only when a spec actually changed, so a
+    // routine settings save doesn't churn the OS registration.
+    if shortcuts_changed {
+        register_shortcuts(&app, &new_settings);
+    }
+}
+
+/// Flip the blur mode between deep-focus and ambient, persist it, apply it
+/// live, and notify the settings UI so its segmented toggle stays in sync.
+fn toggle_blur_mode<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let state = app.state::<AppState>();
+    let new_settings = {
+        let mut s = state.settings.lock().unwrap();
+        s.blur_mode = if s.blur_mode == "ambient" {
+            "deep_focus".into()
+        } else {
+            "ambient".into()
+        };
+        s.save();
+        s.clone()
+    };
+    let active = *state.active.lock().unwrap();
+    overlay::update_overlay(&new_settings, active);
+    let _ = app.emit("settings-updated", new_settings);
+}
+
+/// Show/hide the settings window. When it's already visible this hides it —
+/// identical to clicking its X button (which also just hides, not quits).
+fn toggle_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("settings") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+        } else {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+}
+
+/// Map a single key token (already lowercased) to a keyboard_types `Code`.
+/// Handles bare letters/digits ("f" -> KeyF, "5" -> Digit5) and function
+/// keys ("f5" -> F5); anything else is tried verbatim against `Code`'s
+/// W3C-code parser (e.g. "space", "enter" won't match — pass "Space").
+fn key_to_code(token: &str) -> Option<Code> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let normalized = if t.len() == 1 && t.as_bytes()[0].is_ascii_alphabetic() {
+        format!("Key{}", t.to_ascii_uppercase())
+    } else if t.len() == 1 && t.as_bytes()[0].is_ascii_digit() {
+        format!("Digit{t}")
+    } else if t.starts_with('f') && t[1..].chars().all(|c| c.is_ascii_digit()) && t.len() > 1 {
+        format!("F{}", &t[1..])
+    } else {
+        // Title-case so "space"/"enter"/"tab" match W3C "Space"/"Enter"/"Tab".
+        let mut c = t.chars();
+        c.next()
+            .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
+            .unwrap_or_default()
+    };
+    Code::from_str(&normalized).ok()
+}
+
+/// Parse a "+"-delimited hotkey spec (e.g. "Ctrl+Alt+Win+F") into a
+/// `Shortcut`. Modifier aliases are case-insensitive; "Win"/"Super"/"Meta"/
+/// "Cmd" all map to the Windows/Super key. Returns None if no key is present
+/// or the key token is unrecognized (e.g. an empty/disabled spec).
+fn parse_shortcut(spec: &str) -> Option<Shortcut> {
+    let mut mods = Modifiers::empty();
+    let mut code: Option<Code> = None;
+    for token in spec.split('+') {
+        let t = token.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => mods |= Modifiers::CONTROL,
+            "alt" | "option" | "opt" => mods |= Modifiers::ALT,
+            "shift" => mods |= Modifiers::SHIFT,
+            "win" | "windows" | "super" | "meta" | "cmd" | "command" => mods |= Modifiers::SUPER,
+            key => code = key_to_code(key),
+        }
+    }
+    code.map(|c| Shortcut::new(if mods.is_empty() { None } else { Some(mods) }, c))
+}
+
+/// (Re)bind every global hotkey from the current settings. Unregisters
+/// whatever was bound before, then registers each spec that parses. A blank or
+/// unparseable spec is simply skipped (that action gets no hotkey) rather than
+/// erroring. Each shortcut fires its action on key-down only — the released
+/// edge would otherwise trigger twice per press.
+fn register_shortcuts<R: tauri::Runtime>(app: &tauri::AppHandle<R>, settings: &AppSettings) {
+    let gs = app.global_shortcut();
+    let state = app.state::<AppState>();
+    for prev in state.shortcuts.lock().unwrap().drain(..) {
+        let _ = gs.unregister(prev);
+    }
+
+    let mut registered = Vec::new();
+    let mut bind = |spec: &str, action: fn(&tauri::AppHandle<R>)| {
+        let Some(shortcut) = parse_shortcut(spec) else {
+            return;
+        };
+        let handle = app.clone();
+        let ok = gs
+            .on_shortcut(shortcut, move |_app, _sc, event| {
+                if event.state == ShortcutState::Pressed {
+                    action(&handle);
+                }
+            })
+            .is_ok();
+        if ok {
+            registered.push(shortcut);
+        }
+    };
+
+    bind(&settings.toggle_shortcut, toggle_active_with_handle_action);
+    bind(&settings.mode_shortcut, toggle_blur_mode);
+    bind(&settings.settings_shortcut, toggle_settings_window);
+
+    *state.shortcuts.lock().unwrap() = registered;
+}
+
+/// Thin wrapper so the toggle action has the same `fn(&AppHandle)` shape as the
+/// other hotkey actions (`toggle_active_with_handle` returns the new state).
+fn toggle_active_with_handle_action<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    toggle_active_with_handle(app);
 }
 
 /// Single chokepoint for changing the active state. Every toggle/set
@@ -111,6 +251,7 @@ pub fn run() {
     let state = AppState {
         settings: Arc::new(Mutex::new(settings)),
         active: Arc::new(Mutex::new(false)),
+        shortcuts: Arc::new(Mutex::new(Vec::new())),
     };
 
     tauri::Builder::default()
@@ -121,26 +262,8 @@ pub fn run() {
             let toggle_i = MenuItem::with_id(app, "toggle", "Toggle Monocle", true, None::<&str>)?;
             let settings_i =
                 MenuItem::with_id(app, "settings", "Settings...", true, None::<&str>)?;
-            let blur_test_i =
-                MenuItem::with_id(app, "blur_test", "Blur Test", true, None::<&str>)?;
-            let blur_progressive_i = MenuItem::with_id(
-                app,
-                "blur_progressive",
-                "Progressive Blur Test",
-                true,
-                None::<&str>,
-            )?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Monocle", true, None::<&str>)?;
-            let menu = Menu::with_items(
-                app,
-                &[
-                    &toggle_i,
-                    &settings_i,
-                    &blur_test_i,
-                    &blur_progressive_i,
-                    &quit_i,
-                ],
-            )?;
+            let menu = Menu::with_items(app, &[&toggle_i, &settings_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::new()
                 .tooltip("Monocle")
@@ -157,12 +280,6 @@ pub fn run() {
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
-                        }
-                        "blur_test" => {
-                            blur_proto::open();
-                        }
-                        "blur_progressive" => {
-                            blur_proto::open_progressive();
                         }
                         "quit" => {
                             app_handle.exit(0);
@@ -217,10 +334,6 @@ pub fn run() {
                 }
             }
 
-            // Blur prototype test panels remain available from the tray
-            // ("Blur Test" / "Progressive Blur Test"); no longer auto-opened
-            // now that the blur is integrated into the production overlay.
-
             // Start mouse shake detection in a background thread
             let shake_handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -228,6 +341,10 @@ pub fn run() {
                     toggle_active_with_handle(&shake_handle);
                 });
             });
+
+            // Bind the global hotkeys from the loaded settings.
+            let settings_snapshot = app.state::<AppState>().settings.lock().unwrap().clone();
+            register_shortcuts(app.handle(), &settings_snapshot);
 
             Ok(())
         })

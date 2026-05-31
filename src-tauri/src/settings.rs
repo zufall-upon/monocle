@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 fn default_fade_duration_secs() -> f64 { 0.75 }
 fn default_gpu_blur_intensity() -> f64 { 0.3 }
 fn default_blur_mode() -> String { "deep_focus".into() }
+fn default_toggle_shortcut() -> String { "Ctrl+Alt+Win+F".into() }
+fn default_mode_shortcut() -> String { "Ctrl+Alt+Win+M".into() }
+fn default_settings_shortcut() -> String { "Ctrl+Alt+Win+C".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -35,6 +38,16 @@ pub struct AppSettings {
     // edit, so it takes effect instantly and reverses cleanly.
     #[serde(default)]
     pub hide_desktop_icons: bool,
+    // Global hotkeys, as "+"-delimited specs (e.g. "Ctrl+Alt+Win+F"). Parsed
+    // in lib.rs; "Win"/"Super"/"Meta" all map to the Windows key. An empty
+    // string disables that hotkey. toggle = on/off, mode = switch blur mode,
+    // settings = show/hide the settings window.
+    #[serde(default = "default_toggle_shortcut")]
+    pub toggle_shortcut: String,
+    #[serde(default = "default_mode_shortcut")]
+    pub mode_shortcut: String,
+    #[serde(default = "default_settings_shortcut")]
+    pub settings_shortcut: String,
     pub start_on_login: bool,
 }
 
@@ -53,6 +66,9 @@ impl Default for AppSettings {
             app_wide_focus: false,
             blur_taskbar: false,
             hide_desktop_icons: false,
+            toggle_shortcut: default_toggle_shortcut(),
+            mode_shortcut: default_mode_shortcut(),
+            settings_shortcut: default_settings_shortcut(),
             start_on_login: false,
         }
     }
