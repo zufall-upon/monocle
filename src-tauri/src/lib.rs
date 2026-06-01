@@ -33,20 +33,27 @@ fn get_settings(state: tauri::State<AppState>) -> AppSettings {
 
 #[tauri::command]
 fn update_settings(app: tauri::AppHandle, state: tauri::State<AppState>, new_settings: AppSettings) {
-    let shortcuts_changed = {
+    let (shortcuts_changed, start_changed) = {
         let mut s = state.settings.lock().unwrap();
-        let changed = s.toggle_shortcut != new_settings.toggle_shortcut
+        let shortcuts_changed = s.toggle_shortcut != new_settings.toggle_shortcut
             || s.mode_shortcut != new_settings.mode_shortcut
             || s.settings_shortcut != new_settings.settings_shortcut;
+        let start_changed = s.start_on_login != new_settings.start_on_login;
         *s = new_settings.clone();
         s.save();
-        changed
+        (shortcuts_changed, start_changed)
     };
     overlay::update_overlay(&new_settings, *state.active.lock().unwrap());
+    // Keep shake detection's distance threshold in sync with the slider.
+    shake::set_sensitivity(new_settings.shake_sensitivity);
     // Rebind the global hotkeys only when a spec actually changed, so a
     // routine settings save doesn't churn the OS registration.
     if shortcuts_changed {
         register_shortcuts(&app, &new_settings);
+    }
+    // Register/unregister the login entry only when the toggle actually flips.
+    if start_changed {
+        set_start_on_login(new_settings.start_on_login);
     }
 }
 
@@ -213,6 +220,20 @@ fn set_active(app: tauri::AppHandle, value: bool) {
     apply_active(&app, value);
 }
 
+/// Every currently-running app the user could ignore, deduped by executable
+/// and sorted by name. Backs the "add ignored app" picker in settings.
+#[tauri::command]
+fn list_running_apps() -> Vec<settings::IgnoredApp> {
+    windows_api::list_app_windows()
+}
+
+/// The frontmost real app behind the settings window, for the quick-add card.
+/// None when there's nothing eligible in front.
+#[tauri::command]
+fn get_foreground_app() -> Option<settings::IgnoredApp> {
+    windows_api::foreground_app()
+}
+
 /// Acquire a named mutex so only one Monocle process can run at a time.
 /// Returns true if we got the lock (first instance), false if another
 /// instance already holds it. The HANDLE is intentionally leaked — the
@@ -242,12 +263,73 @@ fn acquire_single_instance_lock() -> bool {
     true
 }
 
+/// Register or unregister Monocle to launch at user login by writing (or
+/// deleting) a value under HKCU\...\CurrentVersion\Run. Per-user, so it
+/// needs no elevation; the value points at the current executable, so it
+/// self-corrects if the binary moves and the setting is re-applied.
+#[cfg(windows)]
+fn set_start_on_login(enabled: bool) {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY,
+        HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    // Quote the path so a space in it (e.g. "Program Files") still parses as
+    // a single argument when the shell launches it at login.
+    let value: Vec<u16> = format!("\"{}\"", exe.display())
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut hkey = HKEY::default();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        ) != ERROR_SUCCESS
+        {
+            return;
+        }
+
+        if enabled {
+            let bytes = std::slice::from_raw_parts(
+                value.as_ptr() as *const u8,
+                value.len() * std::mem::size_of::<u16>(),
+            );
+            let _ = RegSetValueExW(hkey, w!("Monocle"), None, REG_SZ, Some(bytes));
+        } else {
+            // Deleting a missing value returns an error we intentionally ignore.
+            let _ = RegDeleteValueW(hkey, w!("Monocle"));
+        }
+        let _ = RegCloseKey(hkey);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_start_on_login(_enabled: bool) {}
+
 pub fn run() {
     if !acquire_single_instance_lock() {
         return;
     }
 
     let settings = AppSettings::load();
+    // Reconcile the login entry with the persisted setting on every launch, so
+    // it self-heals if the exe moved or the registry value was edited.
+    set_start_on_login(settings.start_on_login);
     let state = AppState {
         settings: Arc::new(Mutex::new(settings)),
         active: Arc::new(Mutex::new(false)),
@@ -282,6 +364,11 @@ pub fn run() {
                             }
                         }
                         "quit" => {
+                            // Undo any shell state we changed (taskbar
+                            // auto-hide, desktop icons) before exiting, since
+                            // exit(0) skips the deactivate fade that normally
+                            // reverts them.
+                            overlay::restore_shell_state();
                             app_handle.exit(0);
                         }
                         _ => {}
@@ -334,7 +421,11 @@ pub fn run() {
                 }
             }
 
-            // Start mouse shake detection in a background thread
+            // Start mouse shake detection in a background thread, seeded with
+            // the saved sensitivity so the slider's value applies immediately.
+            shake::set_sensitivity(
+                app.state::<AppState>().settings.lock().unwrap().shake_sensitivity,
+            );
             let shake_handle = app.handle().clone();
             std::thread::spawn(move || {
                 shake::start_detection(move || {
@@ -353,6 +444,8 @@ pub fn run() {
             update_settings,
             toggle_active,
             set_active,
+            list_running_apps,
+            get_foreground_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Monocle");

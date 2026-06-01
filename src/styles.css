@@ -4,6 +4,12 @@
   box-sizing: border-box;
 }
 
+/* The `hidden` attribute must win over class-level `display` rules
+   (e.g. .ignored-picker/.ignore-current use display:flex). */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   --bg: #0a0a0a;
   --surface: #141414;
@@ -34,6 +40,24 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+/* Everything below the (fixed) titlebar scrolls, so the window never clips
+   content as sections are added. */
+.scroll-area {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.scroll-area::-webkit-scrollbar {
+  width: 8px;
+}
+
+.scroll-area::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
 }
 
 /* Titlebar */
@@ -457,6 +481,152 @@ input[type="range"]::-webkit-slider-thumb:active {
   border-radius: 4px;
   padding: 1px 5px;
   white-space: nowrap;
+}
+
+/* Ignored apps */
+.footer-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.icon-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.ignored-add-wrap {
+  position: relative;
+}
+
+.ignored-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ignored-app-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.ignored-app-name {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ignored-empty {
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.7;
+  line-height: 1.4;
+}
+
+.ignored-picker {
+  position: absolute;
+  top: 26px;
+  right: 0;
+  z-index: 20;
+  min-width: 180px;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.ignored-picker-item {
+  text-align: left;
+  padding: 6px 8px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ignored-picker-item:hover {
+  background: var(--surface-hover);
+}
+
+.ignored-picker-empty {
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* Quick-add card */
+.ignore-current {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 16px 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ignore-current:hover {
+  background: var(--surface-hover);
+}
+
+.ignore-current.is-ignored {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ignore-current.is-ignored:hover {
+  background: var(--surface);
+}
+
+.ignore-current.is-ignored strong {
+  color: var(--text-dim);
+}
+
+.ignore-current strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.ignore-current-plus {
+  font-size: 18px;
+  line-height: 1;
+  color: var(--text-dim);
 }
 
 .about {

@@ -28,6 +28,7 @@
       </button>
     </div>
 
+    <div class="scroll-area">
     <div class="status-bar">
       <div class="status-indicator" id="status-dot"></div>
       <span class="status-text" id="status-text">Inactive</span>
@@ -37,6 +38,11 @@
     </div>
 
     <div class="hint">Shake your mouse to toggle</div>
+
+    <button class="ignore-current" id="ignore-current" hidden>
+      <span class="ignore-current-label">Ignore <strong id="ignore-current-name"></strong></span>
+      <span class="ignore-current-plus" aria-hidden="true">+</span>
+    </button>
 
     <div class="controls">
       <div class="control-group">
@@ -177,6 +183,18 @@
       </div>
 
       <div class="footer-section">
+        <div class="footer-section-title">
+          <span>Ignored apps</span>
+          <div class="ignored-add-wrap">
+            <button class="icon-btn" id="ignored-add" aria-label="Add ignored app">+</button>
+            <div class="ignored-picker" id="ignored-picker" hidden></div>
+          </div>
+        </div>
+        <div class="ignored-list" id="ignored-list"></div>
+        <div class="ignored-empty" id="ignored-empty">No ignored apps. Ignored apps stay sharp while Monocle is active.</div>
+      </div>
+
+      <div class="footer-section">
         <label class="checkbox-label">
           <input type="checkbox" id="start-on-login" />
           <span class="checkmark"></span>
@@ -188,6 +206,7 @@
           <span class="copyright">© 2026 Bryce Lewis</span>
         </div>
       </div>
+    </div>
     </div>
   </div>
 

@@ -54,6 +54,8 @@ function applySettingsToUI(s) {
   if (match) {
     match.classList.add("active");
   }
+
+  renderIgnoredApps();
 }
 
 function updateStatusUI(active) {
@@ -220,4 +222,134 @@ document.getElementById("start-on-login").addEventListener("change", (e) => {
   saveSettings();
 });
 
+// --- Ignored apps -------------------------------------------------------
+
+// Render the current ignored-apps list (one row each, with a remove button)
+// and toggle the empty-state hint. Reads from the live `settings` object.
+function renderIgnoredApps() {
+  const list = document.getElementById("ignored-list");
+  const empty = document.getElementById("ignored-empty");
+  const apps = settings.ignored_apps || [];
+  list.innerHTML = "";
+  empty.hidden = apps.length > 0;
+  for (const app of apps) {
+    const row = document.createElement("div");
+    row.className = "ignored-app-row";
+    const name = document.createElement("span");
+    name.className = "ignored-app-name";
+    name.textContent = app.name || app.exe;
+    const remove = document.createElement("button");
+    remove.className = "icon-btn";
+    remove.setAttribute("aria-label", `Stop ignoring ${app.name || app.exe}`);
+    remove.textContent = "−"; // minus sign
+    remove.addEventListener("click", () => removeIgnoredApp(app.exe));
+    row.append(name, remove);
+    list.append(row);
+  }
+}
+
+// Append an app to the ignore list (deduped by exe, case-insensitive),
+// persist, and re-render. No-op if already ignored.
+function addIgnoredApp(app) {
+  if (!app || !app.exe) return;
+  const exe = app.exe.toLowerCase();
+  const apps = settings.ignored_apps || (settings.ignored_apps = []);
+  if (apps.some((a) => a.exe.toLowerCase() === exe)) return;
+  apps.push({ exe, name: app.name || app.exe });
+  renderIgnoredApps();
+  saveSettings();
+}
+
+function removeIgnoredApp(exe) {
+  const target = (exe || "").toLowerCase();
+  settings.ignored_apps = (settings.ignored_apps || []).filter(
+    (a) => a.exe.toLowerCase() !== target,
+  );
+  renderIgnoredApps();
+  saveSettings();
+}
+
+// Quick-add card: show the frontmost real app (the one behind this settings
+// window) so a single click ignores it. Hidden only when nothing's eligible;
+// when the app is already ignored the card stays (visual continuity) but
+// greys out and the click is a no-op.
+let foregroundApp = null;
+async function refreshForegroundApp() {
+  foregroundApp = await invoke("get_foreground_app");
+  const card = document.getElementById("ignore-current");
+  if (!foregroundApp) {
+    card.hidden = true;
+    return;
+  }
+  const already = (settings.ignored_apps || []).some(
+    (a) => a.exe.toLowerCase() === foregroundApp.exe.toLowerCase(),
+  );
+  document.getElementById("ignore-current-name").textContent = foregroundApp.name;
+  card.classList.toggle("is-ignored", already);
+  card.hidden = false;
+}
+
+document.getElementById("ignore-current").addEventListener("click", (e) => {
+  if (e.currentTarget.classList.contains("is-ignored")) return;
+  addIgnoredApp(foregroundApp);
+  e.currentTarget.classList.add("is-ignored");
+});
+
+// Section "+" picker: list running apps and let the user ignore one.
+const ignoredPicker = document.getElementById("ignored-picker");
+async function toggleIgnoredPicker() {
+  if (!ignoredPicker.hidden) {
+    ignoredPicker.hidden = true;
+    return;
+  }
+  const apps = await invoke("list_running_apps");
+  const ignored = new Set(
+    (settings.ignored_apps || []).map((a) => a.exe.toLowerCase()),
+  );
+  const available = apps.filter((a) => !ignored.has(a.exe.toLowerCase()));
+  ignoredPicker.innerHTML = "";
+  if (available.length === 0) {
+    const none = document.createElement("div");
+    none.className = "ignored-picker-empty";
+    none.textContent = "No other apps running";
+    ignoredPicker.append(none);
+  } else {
+    for (const app of available) {
+      const item = document.createElement("button");
+      item.className = "ignored-picker-item";
+      item.textContent = app.name || app.exe;
+      item.addEventListener("click", () => {
+        addIgnoredApp(app);
+        ignoredPicker.hidden = true;
+        refreshForegroundApp();
+      });
+      ignoredPicker.append(item);
+    }
+  }
+  ignoredPicker.hidden = false;
+}
+
+document.getElementById("ignored-add").addEventListener("click", (e) => {
+  e.stopPropagation();
+  toggleIgnoredPicker();
+});
+
+// Close the picker when clicking outside it.
+document.addEventListener("click", (e) => {
+  if (!ignoredPicker.hidden && !e.target.closest(".ignored-add-wrap")) {
+    ignoredPicker.hidden = true;
+  }
+});
+
+// Keep the quick-add card pointed at the last-interacted-with window. The
+// backend resolves the topmost real window behind this settings window — which
+// is exactly the app the user last used, on any monitor. Poll so it tracks the
+// user moving between windows live; the focus event refreshes instantly on
+// return to settings.
+getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+  if (focused) refreshForegroundApp();
+});
+setInterval(refreshForegroundApp, 250);
+
 init();
+refreshForegroundApp();

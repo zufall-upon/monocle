@@ -7,6 +7,16 @@ fn default_toggle_shortcut() -> String { "Ctrl+Alt+Win+F".into() }
 fn default_mode_shortcut() -> String { "Ctrl+Alt+Win+M".into() }
 fn default_settings_shortcut() -> String { "Ctrl+Alt+Win+C".into() }
 
+/// One entry in the ignored-apps list. `exe` is the lowercased executable
+/// filename (e.g. "calc.exe") used to match an app's windows; `name` is the
+/// friendly label captured when the app was added, so the list still reads
+/// well even when the app isn't currently running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IgnoredApp {
+    pub exe: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     // GPU Gaussian blur strength (0..1 -> stddev 0..STDDEV_MAX). The
@@ -48,6 +58,11 @@ pub struct AppSettings {
     pub mode_shortcut: String,
     #[serde(default = "default_settings_shortcut")]
     pub settings_shortcut: String,
+    // Apps whose windows always stay sharp (above the blur), regardless of
+    // focus or any other setting. Matched by executable filename; see
+    // IGNORED_EXES / ignored_hwnds in overlay.rs.
+    #[serde(default)]
+    pub ignored_apps: Vec<IgnoredApp>,
     pub start_on_login: bool,
 }
 
@@ -69,6 +84,7 @@ impl Default for AppSettings {
             toggle_shortcut: default_toggle_shortcut(),
             mode_shortcut: default_mode_shortcut(),
             settings_shortcut: default_settings_shortcut(),
+            ignored_apps: Vec::new(),
             start_on_login: false,
         }
     }

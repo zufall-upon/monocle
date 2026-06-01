@@ -1,6 +1,6 @@
 use crate::settings::AppSettings;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 #[cfg(windows)]
@@ -73,12 +73,26 @@ static NEEDS_INITIAL_SETUP: AtomicBool = AtomicBool::new(false);
 // kept above the overlay every tick, so it stays usable for tuning no matter
 // what else is focused. 0 until registered at startup.
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
+// Lowercased executable filenames of ignored apps (e.g. "calc.exe"). Every
+// window of a matching process is kept sharp (above the overlay, footprint
+// neutralized in the blur), regardless of focus or any other setting. Set from
+// settings via `update_overlay`. Empty is the common case and short-circuits
+// all per-tick work.
+static IGNORED_EXES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+// Sentinel key for the ignored-app group in the focus-rect map. Real keys are
+// HMONITOR handles (always positive), so -1 never collides.
+const IGNORED_FOCUS_KEY: isize = -1;
+// User setting: while Monocle is active, switch the Windows taskbar into real
+// OS auto-hide (it slides off-screen and reappears on edge-hover), rather than
+// blurring it in place. Named `blur_taskbar` for settings back-compat.
 static BLUR_TASKBAR: AtomicBool = AtomicBool::new(false);
-// True while the taskbar has been demoted out of the topmost band and pushed
-// below the overlay so the GPU blur composites over it. Tracks demotion so
-// deactivation — or toggling the setting off mid-session — can restore the
-// taskbar to its normal topmost, crisp, clickable state.
-static TASKBAR_DEMOTED: AtomicBool = AtomicBool::new(false);
+// True while WE have forced the taskbar into auto-hide. Tracks our own action
+// so deactivation, toggling the setting off, or quitting can put the taskbar
+// back to exactly the state the user had before.
+static TASKBAR_AUTOHIDDEN: AtomicBool = AtomicBool::new(false);
+// The taskbar's appbar state (ABS_* bitmask) captured right before we forced
+// auto-hide, so we can restore it precisely instead of guessing the default.
+static SAVED_TASKBAR_STATE: AtomicI32 = AtomicI32::new(0);
 // User setting: hide the desktop icons while Monocle is active.
 static HIDE_DESKTOP_ICONS: AtomicBool = AtomicBool::new(false);
 // True while WE have hidden the desktop icons. Tracks our own action so
@@ -575,6 +589,54 @@ fn is_eligible_window(hwnd: HWND, all_hwnds: &[isize]) -> bool {
     }
 }
 
+/// Whether a single window belongs to an ignored app (live exe lookup).
+/// Short-circuits when no apps are ignored — the common case.
+#[cfg(windows)]
+fn is_ignored_hwnd(hwnd_val: isize) -> bool {
+    let ignored = IGNORED_EXES.lock().unwrap();
+    if ignored.is_empty() {
+        return false;
+    }
+    match crate::windows_api::exe_name_for_hwnd(hwnd_val) {
+        Some(exe) => ignored.iter().any(|e| *e == exe),
+        None => false,
+    }
+}
+
+/// Every currently-visible window belonging to an ignored app. Empty (and
+/// free) when nothing is ignored. Resolves each window's exe, so callers throttle
+/// how often they invoke it rather than running it every 16ms tick.
+#[cfg(windows)]
+fn ignored_hwnds() -> Vec<isize> {
+    let ignored: Vec<String> = IGNORED_EXES.lock().unwrap().clone();
+    if ignored.is_empty() {
+        return Vec::new();
+    }
+    struct St {
+        ignored: Vec<String>,
+        result: Vec<isize>,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let st = &mut *(lparam.0 as *mut St);
+        if IsWindowVisible(hwnd).as_bool() {
+            if let Some(exe) = crate::windows_api::exe_name_for_hwnd(hwnd.0 as isize) {
+                if st.ignored.iter().any(|e| *e == exe) {
+                    st.result.push(hwnd.0 as isize);
+                }
+            }
+        }
+        BOOL(1)
+    }
+    let mut st = St {
+        ignored,
+        result: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut st as *mut St as isize));
+    }
+    st.result
+}
+
 /// Push a window below root_overlay in z-order AND remember we did so,
 /// so the deactivate path can free it. The PUSHED_DOWN list is
 /// move-to-back: a re-push of an existing entry moves it to the newest
@@ -582,6 +644,11 @@ fn is_eligible_window(hwnd: HWND, all_hwnds: &[isize]) -> bool {
 /// dead by then anyway).
 #[cfg(windows)]
 unsafe fn push_below_overlay(target: HWND, root_overlay: HWND) {
+    // Ignored apps are always sharp — never demote them, no matter which path
+    // (focus change, monitor transfer) asked to.
+    if is_ignored_hwnd(target.0 as isize) {
+        return;
+    }
     let _ = SetWindowPos(
         target, Some(root_overlay), 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
@@ -643,41 +710,60 @@ fn all_taskbar_hwnds() -> Vec<isize> {
     state.result
 }
 
-/// Drop every taskbar out of the topmost band and slot it just behind the
-/// overlay root. The GPU blur captures and blurs each full monitor (taskbar
-/// included), so once a real taskbar sits below the overlay its blurred copy
-/// shows through. Two steps, because the shell taskbar clings to topmost: first
-/// HWND_NOTOPMOST explicitly clears WS_EX_TOPMOST (a single insert-after a
-/// non-topmost window doesn't reliably strip it), then a second call lowers it
-/// below the overlay root in the non-topmost band. Re-running each tick
-/// re-demotes any taskbar whenever Explorer promotes it back to topmost.
+/// Force the system taskbar into (or out of) real OS auto-hide via the shell's
+/// appbar interface. Auto-hide is a single global taskbar state (covers the
+/// primary and every secondary taskbar), so one message does them all. On
+/// enable we snapshot the prior state first; on disable we write that snapshot
+/// back, so the user's original setting (normal or always-on-top) is preserved.
+/// Idempotent through TASKBAR_AUTOHIDDEN — safe to call every tick. The slide
+/// itself is Windows' own auto-hide animation: trying to drive it ourselves
+/// double-animated the primary taskbar (the shell re-docks it from its
+/// registered position when auto-hide engages), so we let the OS own it.
 #[cfg(windows)]
-unsafe fn demote_taskbar(root_overlay: HWND) {
-    for tb_val in all_taskbar_hwnds() {
-        let tb = HWND(tb_val as *mut _);
-        let _ = SetWindowPos(
-            tb, Some(HWND_NOTOPMOST), 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        let _ = SetWindowPos(
-            tb, Some(root_overlay), 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+unsafe fn set_taskbar_autohide(enable: bool) {
+    use windows::Win32::UI::Shell::{
+        SHAppBarMessage, ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA,
+    };
+
+    let taskbar = FindWindowW(windows::core::w!("Shell_TrayWnd"), None).unwrap_or_default();
+    let mut abd = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        hWnd: taskbar,
+        ..Default::default()
+    };
+
+    if enable {
+        if TASKBAR_AUTOHIDDEN.swap(true, Ordering::Relaxed) {
+            return; // already auto-hidden — nothing to do
+        }
+        let prev = SHAppBarMessage(ABM_GETSTATE, &mut abd) as i32;
+        SAVED_TASKBAR_STATE.store(prev, Ordering::Relaxed);
+        abd.lParam = LPARAM(ABS_AUTOHIDE as isize);
+        SHAppBarMessage(ABM_SETSTATE, &mut abd);
+    } else {
+        if !TASKBAR_AUTOHIDDEN.swap(false, Ordering::Relaxed) {
+            return; // we never auto-hid it — leave the user's state alone
+        }
+        abd.lParam = LPARAM(SAVED_TASKBAR_STATE.load(Ordering::Relaxed) as isize);
+        SHAppBarMessage(ABM_SETSTATE, &mut abd);
     }
 }
 
-/// Return every taskbar to the topmost band so they're crisp and on top again.
-/// Called when the overlay deactivates or the blur-taskbar setting is turned
-/// off.
+/// Restore any shell state Monocle changed (taskbar auto-hide, desktop icons).
+/// Called on quit, where the deactivate fade path that normally reverts these
+/// never runs.
 #[cfg(windows)]
-unsafe fn restore_taskbar() {
-    for tb_val in all_taskbar_hwnds() {
-        let _ = SetWindowPos(
-            HWND(tb_val as *mut _), Some(HWND_TOPMOST), 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+pub fn restore_shell_state() {
+    unsafe {
+        set_taskbar_autohide(false);
+        if ICONS_HIDDEN.swap(false, Ordering::Relaxed) {
+            set_desktop_icons(true);
+        }
     }
 }
+
+#[cfg(not(windows))]
+pub fn restore_shell_state() {}
 
 /// Locate the desktop's `SHELLDLL_DefView` — the shell view that hosts the
 /// desktop icons and owns the "Show desktop icons" toggle command. Normally a
@@ -1135,6 +1221,13 @@ fn foreground_tracker() {
     let mut monitor_focused: HashMap<isize, Vec<isize>> = HashMap::new();
     let mut last_fg: isize = 0;
 
+    // Cached set of ignored-app windows. Resolving each window's exe is too
+    // costly to do every tick, so refresh it on a slower cadence (and on any
+    // foreground change, handled below). Empty whenever no apps are ignored.
+    let mut ignored: Vec<isize> = Vec::new();
+    let mut ignored_refresh: u32 = 0;
+    const IGNORED_REFRESH_TICKS: u32 = 30; // ~0.5s at 16ms
+
     const TICK_MS: f64 = 16.0;
     let tick = std::time::Duration::from_millis(TICK_MS as u64);
     // Animations advance by real elapsed time, not a fixed per-tick step.
@@ -1191,12 +1284,10 @@ fn foreground_tracker() {
                             // had them. Forcibly raising the blurred windows
                             // here is what made them reshuffle on deactivate.
                             PUSHED_DOWN.lock().unwrap().clear();
-                            // If we demoted the taskbar to blur it, lift it
-                            // back into the topmost band so it's crisp and
-                            // clickable again now that Monocle is off.
-                            if TASKBAR_DEMOTED.swap(false, Ordering::Relaxed) {
-                                restore_taskbar();
-                            }
+                            // If we forced the taskbar into auto-hide, put it
+                            // back the way the user had it now that Monocle is
+                            // off.
+                            set_taskbar_autohide(false);
                             // Bring desktop icons back once the overlay has
                             // fully faded out, so they reappear with the
                             // background rather than popping in early.
@@ -1241,8 +1332,17 @@ fn foreground_tracker() {
             if !OVERLAY_ACTIVE.load(Ordering::Relaxed) {
                 last_fg = 0;
                 monitor_focused.clear();
+                ignored.clear();
                 continue;
             }
+
+            // Refresh the ignored-app window set on a slow cadence (exe lookups
+            // are too costly per tick). Foreground changes also force a refresh
+            // further down so a newly-opened ignored window goes sharp promptly.
+            if ignored_refresh == 0 {
+                ignored = ignored_hwnds();
+            }
+            ignored_refresh = (ignored_refresh + 1) % IGNORED_REFRESH_TICKS;
 
             // Keep every GPU blur window pinned directly above the top blur
             // placeholder (hwnds[9]) — and therefore below tint/grain. The
@@ -1254,18 +1354,21 @@ fn foreground_tracker() {
             // each window's footprint in the captured frame (no halo). Reflects
             // last tick's groups — a 16ms lag that's invisible against the
             // fade. Covers every path (initial setup, monitor transfer, focus
-            // change) uniformly.
-            update_focus_rects(&monitor_focused);
-
-            // Taskbar blur: keep the taskbar demoted below the overlay each
-            // tick (re-demoting if Explorer promotes it back), or restore it
-            // if the setting was toggled off while Monocle is still active.
-            if BLUR_TASKBAR.load(Ordering::Relaxed) {
-                demote_taskbar(HWND(hwnds[0] as *mut _));
-                TASKBAR_DEMOTED.store(true, Ordering::Relaxed);
-            } else if TASKBAR_DEMOTED.swap(false, Ordering::Relaxed) {
-                restore_taskbar();
+            // change) uniformly. Ignored apps are folded in under a sentinel key
+            // so their footprints are neutralized too.
+            if ignored.is_empty() {
+                update_focus_rects(&monitor_focused);
+            } else {
+                let mut combined = monitor_focused.clone();
+                combined.insert(IGNORED_FOCUS_KEY, ignored.clone());
+                update_focus_rects(&combined);
             }
+
+            // Taskbar auto-hide: drive the real OS auto-hide while active, and
+            // undo it the moment the setting is toggled off. Both calls are
+            // idempotent (guarded by TASKBAR_AUTOHIDDEN), so running them every
+            // tick is cheap and self-corrects if anything changes the state.
+            set_taskbar_autohide(BLUR_TASKBAR.load(Ordering::Relaxed));
 
             // Desktop icons: hide them while active, or re-show them if the
             // setting was toggled off mid-session. set_desktop_icons is
@@ -1290,6 +1393,25 @@ fn foreground_tracker() {
                         sw, Some(HWND_TOP), 0, 0, 0, 0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                     );
+                }
+            }
+
+            // Keep ignored-app windows above the overlay. Like the focused
+            // groups, only lift one that has actually fallen behind the overlay,
+            // so already-sharp ignored windows don't get reshuffled (flicker).
+            {
+                let root_overlay = HWND(hwnds[0] as *mut _);
+                for &w in &ignored {
+                    let hw = HWND(w as *mut _);
+                    if IsWindow(Some(hw)).as_bool()
+                        && IsWindowVisible(hw).as_bool()
+                        && !is_above_overlay(hw, root_overlay)
+                    {
+                        let _ = SetWindowPos(
+                            hw, Some(HWND_TOP), 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
                 }
             }
 
@@ -1333,6 +1455,11 @@ fn foreground_tracker() {
                     for &g in &group { sharp_set.insert(g); }
                     monitor_focused.insert(mon, group);
                 }
+
+                // Ignored apps always stay sharp regardless of focus, so fold
+                // their windows into the sharp block: the lift below raises them
+                // and the blurred-drop loop skips them.
+                for &w in &ignored { sharp_set.insert(w); }
 
                 // The sharp windows in their existing relative z-order. No window
                 // ever moves relative to another — we lift this whole block above
@@ -1390,8 +1517,8 @@ fn foreground_tracker() {
                 // that the overlay stack moved.
                 crate::gpu_blur::reassert_z(hwnds[BLUR_LAYERS - 1]);
 
-                // Keep the taskbar above the overlay unless the user opted to
-                // blur it (the per-tick demote handles that case).
+                // Keep the taskbar crisp above the overlay unless the user
+                // opted to auto-hide it (handled by the per-tick auto-hide).
                 if !BLUR_TASKBAR.load(Ordering::Relaxed) {
                     for tb_val in all_taskbar_hwnds() {
                         let _ = SetWindowPos(
@@ -1487,6 +1614,11 @@ fn foreground_tracker() {
 
             if fg_val == last_fg { continue; }
 
+            // Foreground changed — re-resolve ignored windows next tick so a
+            // newly-opened or newly-focused ignored app goes sharp promptly
+            // instead of waiting out the slow refresh cadence.
+            ignored_refresh = 0;
+
             let monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
             let monitor_key = monitor.0 as isize;
             let new_group = focused_group(fg, &hwnds, monitor_key);
@@ -1558,6 +1690,21 @@ fn foreground_tracker() {
                     }
                 }
             }
+
+            // Make sure the foreground window itself is above the overlay.
+            // Usually the click that focused it already raised it (the grain
+            // catcher lifts the clicked window), so this is a no-op. But focus
+            // can also return *programmatically* with no click — a modal dialog
+            // or file picker closing hands focus back to its owner — and then
+            // nothing has lifted it, leaving the user's app blurred. Lift it
+            // here so it sharpens whether it was clicked or not.
+            if !is_above_overlay(fg, root_overlay) {
+                let _ = SetWindowPos(
+                    fg, Some(HWND_TOP), 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+
             if let Some(group) = monitor_focused.get(&monitor_key) {
                 for &w in group {
                     if w == fg_val { continue; }
@@ -1702,6 +1849,21 @@ pub fn update_overlay(settings: &AppSettings, active: bool) {
             || prev_app_wide != settings.app_wide_focus)
     {
         NEEDS_INITIAL_SETUP.store(true, Ordering::Relaxed);
+    }
+    // Ignored apps: refresh the match set. If it changed while active, force a
+    // fresh focus pass so newly-ignored apps pop sharp and un-ignored ones
+    // blur immediately, instead of waiting for the next foreground change.
+    {
+        let new_ignored: Vec<String> = settings
+            .ignored_apps
+            .iter()
+            .map(|a| a.exe.to_lowercase())
+            .collect();
+        let mut cur = IGNORED_EXES.lock().unwrap();
+        if active && *cur != new_ignored {
+            NEEDS_INITIAL_SETUP.store(true, Ordering::Relaxed);
+        }
+        *cur = new_ignored;
     }
     BLUR_TASKBAR.store(settings.blur_taskbar, Ordering::Relaxed);
     HIDE_DESKTOP_ICONS.store(settings.hide_desktop_icons, Ordering::Relaxed);

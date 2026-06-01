@@ -16,7 +16,7 @@
         "label": "settings",
         "title": "Monocle",
         "width": 420,
-        "height": 560,
+        "height": 600,
         "resizable": false,
         "center": true,
         "visible": false,
