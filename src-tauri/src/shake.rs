@@ -21,13 +21,24 @@ static SHAKE_CALLBACK: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
 // foreground tracker holds, so running it on the hook thread is exactly
 // that trap. Sending on an unbounded channel is effectively instant, so
 // the hook proc always returns well under the timeout.
-static SHAKE_TX: Mutex<Option<Sender<()>>> = Mutex::new(None);
+static SHAKE_TX: Mutex<Option<Sender<ShakeFire>>> = Mutex::new(None);
+
+/// Diagnostics sent with each fired shake so the log can show whether it was a
+/// deliberate gesture or an accidental jitter (a short span = suspicious).
+struct ShakeFire {
+    reversals: u32,
+    span_ms: u128,
+    min_delta: i32,
+}
 
 struct ShakeState {
     last_x: i32,
     last_dir: i32,
     reversals: u32,
     last_reversal_time: Instant,
+    // When the current reversal chain began, so we can report how long the
+    // whole shake took (a very short span hints at an accidental trigger).
+    chain_start: Instant,
     // After a trigger we ignore movement until this instant, so the tail of the
     // same shake (or an immediate second shake) can't toggle Monocle back.
     cooldown_until: Instant,
@@ -78,6 +89,7 @@ unsafe extern "system" fn mouse_hook_proc(
             last_dir: 0,
             reversals: 0,
             last_reversal_time: now,
+            chain_start: now,
             cooldown_until: now,
         });
 
@@ -101,11 +113,18 @@ unsafe extern "system" fn mouse_hook_proc(
                 if elapsed < SHAKE_TIME_WINDOW_MS {
                     state.reversals += 1;
                 } else {
+                    // Chain broke (too long a pause) — start a fresh one.
                     state.reversals = 1;
+                    state.chain_start = now;
                 }
                 state.last_reversal_time = now;
 
                 if state.reversals >= SHAKE_REVERSALS_NEEDED {
+                    let fire = ShakeFire {
+                        reversals: state.reversals,
+                        span_ms: now.duration_since(state.chain_start).as_millis(),
+                        min_delta: SHAKE_MIN_DELTA.load(Ordering::Relaxed),
+                    };
                     state.reversals = 0;
                     state.cooldown_until = now + SHAKE_COOLDOWN;
                     drop(state_lock);
@@ -113,7 +132,7 @@ unsafe extern "system" fn mouse_hook_proc(
                     // never run the toggle on the hook thread (see SHAKE_TX).
                     if let Ok(tx) = SHAKE_TX.lock() {
                         if let Some(ref sender) = *tx {
-                            let _ = sender.send(());
+                            let _ = sender.send(fire);
                         }
                     }
                     return CallNextHookEx(None, n_code, w_param, l_param);
@@ -137,10 +156,14 @@ pub fn start_detection<F: Fn() + Send + 'static>(on_shake: F) {
     // Worker thread that actually runs the toggle. The hook proc only
     // signals it through the channel, keeping the hook proc fast enough
     // to never trip LowLevelHooksTimeout.
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<ShakeFire>();
     *SHAKE_TX.lock().unwrap() = Some(tx);
     std::thread::spawn(move || {
-        while rx.recv().is_ok() {
+        while let Ok(fire) = rx.recv() {
+            crate::logging::log(&format!(
+                "shake fired: {} reversals in {}ms (min_delta={}px)",
+                fire.reversals, fire.span_ms, fire.min_delta
+            ));
             let cb = SHAKE_CALLBACK.lock().unwrap();
             if let Some(ref f) = *cb {
                 f();

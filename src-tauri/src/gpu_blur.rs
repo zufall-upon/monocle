@@ -81,6 +81,13 @@ pub fn set_focus_rects(rects: &[(i32, i32, i32, i32)]) {
     imp::set_focus_rects(rects);
 }
 
+/// Set the origin (virtual-screen coords) the next blur fade-in should sweep
+/// outward from, or `None` to fade in uniformly. Cleared on deactivate.
+#[cfg(windows)]
+pub fn set_activation_reveal(origin: Option<(i32, i32)>) {
+    imp::set_activation_reveal(origin);
+}
+
 #[cfg(not(windows))]
 pub fn init() {}
 #[cfg(not(windows))]
@@ -97,11 +104,13 @@ pub fn set_active(_active: bool) {}
 pub fn reassert_z(_insert_after: isize) {}
 #[cfg(not(windows))]
 pub fn set_focus_rects(_rects: &[(i32, i32, i32, i32)]) {}
+#[cfg(not(windows))]
+pub fn set_activation_reveal(_origin: Option<(i32, i32)>) {}
 
 #[cfg(windows)]
 mod imp {
     use std::cell::{Cell, RefCell};
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use windows::core::{factory, w, IInspectable, Interface};
@@ -113,13 +122,14 @@ mod imp {
     use windows::Graphics::DirectX::DirectXPixelFormat;
     use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Direct2D::Common::{
-        D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BLEND_MODE_COLOR,
+        D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BLEND_MODE_DISSOLVE,
         D2D1_BORDER_MODE_HARD, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_GRADIENT_STOP,
         D2D1_PIXEL_FORMAT, D2D_RECT_F,
     };
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, ID2D1Bitmap1, ID2D1Brush, ID2D1DeviceContext, ID2D1Effect,
-        ID2D1Factory1, ID2D1Image, ID2D1LinearGradientBrush, ID2D1Properties, ID2D1RenderTarget,
+        ID2D1Factory1, ID2D1Image, ID2D1LinearGradientBrush, ID2D1Properties,
+        ID2D1RadialGradientBrush, ID2D1RenderTarget,
         CLSID_D2D1Blend, CLSID_D2D1CrossFade, CLSID_D2D1Flood, CLSID_D2D1GaussianBlur,
         CLSID_D2D1Saturation, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
@@ -129,7 +139,7 @@ mod imp {
         D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_LINEAR,
         D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
         D2D1_PROPERTY_TYPE_ENUM, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4,
-        D2D1_SATURATION_PROP_SATURATION,
+        D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_SATURATION_PROP_SATURATION,
     };
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
@@ -194,6 +204,24 @@ mod imp {
     // blur. Updated each tracker tick; draw() reads them per monitor.
     static FOCUS_RECTS: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
 
+    // Activation reveal: when enabled, the blur's fade-in is masked by a circle
+    // that grows from (REVEAL_X, REVEAL_Y) (virtual-screen coords) as the fade
+    // progresses, so the blur sweeps outward from that point instead of fading
+    // in uniformly. Set on a shake activation (origin = cursor), cleared on any
+    // other activation and on deactivate. Only affects the fade-in; once fade
+    // hits 1.0 the circle covers everything and the mask is a no-op.
+    static REVEAL_ENABLED: AtomicBool = AtomicBool::new(false);
+    static REVEAL_X: AtomicI32 = AtomicI32::new(0);
+    static REVEAL_Y: AtomicI32 = AtomicI32::new(0);
+
+    fn reveal_origin() -> Option<(i32, i32)> {
+        if REVEAL_ENABLED.load(Ordering::Relaxed) {
+            Some((REVEAL_X.load(Ordering::Relaxed), REVEAL_Y.load(Ordering::Relaxed)))
+        } else {
+            None
+        }
+    }
+
     fn stddev() -> f32 {
         f32::from_bits(STDDEV_BITS.load(Ordering::Relaxed))
     }
@@ -251,6 +279,17 @@ mod imp {
         *cur = rects.to_vec();
         drop(cur);
         sync();
+    }
+
+    pub fn set_activation_reveal(origin: Option<(i32, i32)>) {
+        match origin {
+            Some((x, y)) => {
+                REVEAL_X.store(x, Ordering::Relaxed);
+                REVEAL_Y.store(y, Ordering::Relaxed);
+                REVEAL_ENABLED.store(true, Ordering::Relaxed);
+            }
+            None => REVEAL_ENABLED.store(false, Ordering::Relaxed),
+        }
     }
 
     fn sync() {
@@ -333,6 +372,10 @@ mod imp {
         // layer masks for ambient (progressive) blur. Each band feathers the
         // handoff between adjacent blur levels across its own screen slice.
         grad_bands: Vec<ID2D1LinearGradientBrush>,
+        // Radial opacity mask for the shake activation reveal: opaque core
+        // (blur shown) feathering to transparent at the rim. Its center/radius
+        // are set per-frame from the cursor origin and fade progress.
+        reveal_brush: ID2D1RadialGradientBrush,
         framepool: Direct3D11CaptureFramePool,
         d3d_ctx: ID3D11DeviceContext,
         cap_tex: ID3D11Texture2D,
@@ -483,17 +526,17 @@ mod imp {
         let saturation = ctx.CreateEffect(&CLSID_D2D1Saturation)?;
         let gaussian = ctx.CreateEffect(&CLSID_D2D1GaussianBlur)?;
 
-        // Tint chain. The Color blend takes hue+saturation from its source
-        // (the flood color) and luminance from its destination (the saturated
-        // capture), i.e. a true colorize. CrossFade then mixes the untinted
-        // and colorized images by `strength`. Blend mode is set once; the
-        // flood color and crossfade weight are updated per-frame in draw().
+        // Tint chain. The blend composites the flood (tint color, source) over
+        // the saturated capture (destination); CrossFade then mixes the untinted
+        // and tinted images by `strength`. Dissolve mode — a per-pixel dither —
+        // gives the grainy color wash that reads best over the blur. Set once;
+        // the flood color and crossfade weight are updated per-frame in draw().
         let flood = ctx.CreateEffect(&CLSID_D2D1Flood)?;
         let blend = ctx.CreateEffect(&CLSID_D2D1Blend)?;
         let crossfade = ctx.CreateEffect(&CLSID_D2D1CrossFade)?;
         {
             let props: &ID2D1Properties = (&blend).into();
-            let mode = D2D1_BLEND_MODE_COLOR.0 as u32;
+            let mode = D2D1_BLEND_MODE_DISSOLVE.0 as u32;
             let _ = props.SetValue(
                 D2D1_BLEND_PROP_MODE.0 as u32,
                 D2D1_PROPERTY_TYPE_ENUM,
@@ -563,6 +606,50 @@ mod imp {
                 grad_bands.push(brush);
             }
         }
+
+        // Radial mask for the activation reveal. Alpha 1 from the center out to
+        // 70% of the radius, then feathered to 0 across the outer 30% for a soft
+        // edge; CLAMP keeps everything beyond the radius transparent. Center and
+        // radius are rewritten each frame in draw() — these are placeholders.
+        // The opaque-core fraction here must match REVEAL_CORE in draw().
+        let reveal_brush: ID2D1RadialGradientBrush = {
+            let stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.70,
+                    color: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                },
+                // A midpoint stop biases the ramp toward the rim so the falloff
+                // looks gradual rather than a hard linear cut.
+                D2D1_GRADIENT_STOP {
+                    position: 0.88,
+                    color: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.5 },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+                },
+            ];
+            let rt: &ID2D1RenderTarget = (&ctx).into();
+            let coll = rt.CreateGradientStopCollection(
+                &stops,
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            )?;
+            rt.CreateRadialGradientBrush(
+                &D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+                    center: windows_numerics::Vector2 { X: 0.0, Y: 0.0 },
+                    gradientOriginOffset: windows_numerics::Vector2 { X: 0.0, Y: 0.0 },
+                    radiusX: 1.0,
+                    radiusY: 1.0,
+                },
+                None,
+                &coll,
+            )?
+        };
 
         // --- WGC capture of this monitor ---
         let d3d_device: IDirect3DDevice =
@@ -649,6 +736,7 @@ mod imp {
                 blend,
                 crossfade,
                 grad_bands,
+                reveal_brush,
                 framepool,
                 d3d_ctx,
                 cap_tex,
@@ -769,8 +857,7 @@ mod imp {
             let src: ID2D1Image = if strength > 0.001 {
                 set_flood_color(&rs.flood, tr, tg, tb);
                 let flood_out = rs.flood.GetOutput()?;
-                // Color blend: dest (input 0) supplies luminance, source
-                // (input 1) supplies hue+saturation.
+                // dest (input 0) = background, source (input 1) = tint color.
                 rs.blend.SetInput(0, &sat_out, true);
                 rs.blend.SetInput(1, &flood_out, true);
                 let blend_out = rs.blend.GetOutput()?;
@@ -793,6 +880,63 @@ mod imp {
             let show_deep = mix < 0.999;
             let show_ambient = mix > 0.001;
 
+            // --- Activation reveal: while a shake activation is fading in, mask
+            // the whole blur composite with a circle that grows from the cursor
+            // origin so the blur sweeps outward instead of fading in uniformly.
+            // Active only during the fade-in (fade < 1 and ACTIVE); once the
+            // circle covers the screen it stops applying. The inner blur paths
+            // then draw at full opacity (inner_fade = 1) and this radial layer
+            // is the sole gate; otherwise they fade as before.
+            let reveal = if ACTIVE.load(Ordering::Relaxed) && fade < 0.999 {
+                reveal_origin()
+            } else {
+                None
+            };
+            let revealing = reveal.is_some();
+            if let Some((vx, vy)) = reveal {
+                let cx = (vx - rs.origin_x) as f32;
+                let cy = (vy - rs.origin_y) as f32;
+                // Cover out to the farthest corner. Dividing by the opaque-core
+                // fraction (REVEAL_CORE) guarantees the solid region reaches that
+                // corner exactly when the sweep completes.
+                const REVEAL_CORE: f32 = 0.70;
+                let far = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)]
+                    .iter()
+                    .map(|&(px, py)| ((px - cx).powi(2) + (py - cy).powi(2)).sqrt())
+                    .fold(0.0_f32, f32::max);
+                // The fade value is a cubic ease-OUT (fade = 1−(1−p)³), tuned so
+                // the blur *opacity* appears instantly. That fast onset makes a
+                // growing circle snap then crawl. Recover the linear time p and
+                // drive the radius with smootherstep instead, for an even sweep
+                // that eases in and out symmetrically.
+                let p = 1.0 - (1.0 - fade).max(0.0).cbrt();
+                // The reveal is gated off at fade ≈ 0.999, i.e. p ≈ 0.9, so map
+                // the radius to reach full coverage by then (not at p = 1.0),
+                // otherwise the farthest corner pops the last few % when the
+                // mask switches off. Linear in time — a constant-speed sweep
+                // reads cleaner than an eased one.
+                let t = (p / 0.9).clamp(0.0, 1.0) as f32;
+                let radius = (far / REVEAL_CORE) * t;
+                rs.reveal_brush.SetCenter(windows_numerics::Vector2 { X: cx, Y: cy });
+                rs.reveal_brush.SetRadiusX(radius.max(1.0));
+                rs.reveal_brush.SetRadiusY(radius.max(1.0));
+                let brush: ID2D1Brush = rs.reveal_brush.cast()?;
+                let layer = D2D1_LAYER_PARAMETERS1 {
+                    contentBounds: source_rect,
+                    geometricMask: std::mem::ManuallyDrop::new(None),
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: identity(),
+                    opacity: 1.0,
+                    opacityBrush: std::mem::ManuallyDrop::new(Some(brush)),
+                    layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+                };
+                ctx.PushLayer(&layer, None);
+                let _ = std::mem::ManuallyDrop::into_inner(layer.opacityBrush);
+            }
+            // Inside the reveal the radial mask gates everything, so the inner
+            // paths draw at full opacity; otherwise they use the normal fade.
+            let inner_fade = if revealing { 1.0 } else { fade };
+
             // --- Deep focus: uniform full-screen blur (drawn first, beneath
             // the ambient stack). Opacity = fade. During a transition the
             // ambient stack dissolves in on top; at the bottom of the screen
@@ -803,14 +947,14 @@ mod imp {
                 set_blur(&rs.gaussian, stddev);
                 let output = rs.gaussian.GetOutput()?;
 
-                let faded = fade < 0.999;
+                let faded = inner_fade < 0.999;
                 if faded {
                     let layer = D2D1_LAYER_PARAMETERS1 {
                         contentBounds: source_rect,
                         geometricMask: std::mem::ManuallyDrop::new(None),
                         maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                         maskTransform: identity(),
-                        opacity: fade as f32,
+                        opacity: inner_fade as f32,
                         opacityBrush: std::mem::ManuallyDrop::new(None),
                         layerOptions: D2D1_LAYER_OPTIONS1_NONE,
                     };
@@ -836,7 +980,7 @@ mod imp {
             // in one outer layer at opacity = fade * mix, which folds in both
             // the activation crossfade and the mode-switch dissolve.
             if show_ambient {
-                let amb_opacity = (fade * mix) as f32;
+                let amb_opacity = (inner_fade * mix) as f32;
                 let layered = amb_opacity < 0.999;
                 if layered {
                     let layer = D2D1_LAYER_PARAMETERS1 {
@@ -894,6 +1038,11 @@ mod imp {
                 if layered {
                     ctx.PopLayer();
                 }
+            }
+
+            // Close the activation-reveal layer pushed before the blur paths.
+            if revealing {
+                ctx.PopLayer();
             }
         }
 

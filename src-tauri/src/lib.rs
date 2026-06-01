@@ -1,4 +1,5 @@
 mod gpu_blur;
+mod logging;
 mod magnifier;
 mod overlay;
 mod settings;
@@ -177,14 +178,15 @@ fn register_shortcuts<R: tauri::Runtime>(app: &tauri::AppHandle<R>, settings: &A
 /// Thin wrapper so the toggle action has the same `fn(&AppHandle)` shape as the
 /// other hotkey actions (`toggle_active_with_handle` returns the new state).
 fn toggle_active_with_handle_action<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    toggle_active_with_handle(app);
+    toggle_active_with_handle(app, "hotkey");
 }
 
 /// Single chokepoint for changing the active state. Every toggle/set
 /// entry point (UI button, tray menu, tray icon, shake) goes through
 /// this so the active mutex, the overlay's internal state, and the UI
-/// (via the monocle-toggled event) can never disagree.
-fn apply_active<R: tauri::Runtime>(app: &tauri::AppHandle<R>, value: bool) {
+/// (via the monocle-toggled event) can never disagree. `source` is logged
+/// so an unexpected activation can be traced back to what triggered it.
+fn apply_active<R: tauri::Runtime>(app: &tauri::AppHandle<R>, value: bool, source: &str) {
     let state = app.state::<AppState>();
     let changed = {
         let mut active = state.active.lock().unwrap();
@@ -193,31 +195,40 @@ fn apply_active<R: tauri::Runtime>(app: &tauri::AppHandle<R>, value: bool) {
         prev != value
     };
     if !changed {
+        logging::log(&format!("active: no-op {} (source: {})", value, source));
         return;
+    }
+    logging::log(&format!("active -> {} (source: {})", value, source));
+    // A shake activation sweeps the blur in from the cursor; every other
+    // source (and all deactivations) fades uniformly.
+    if value && source == "shake" {
+        gpu_blur::set_activation_reveal(cursor_pos());
+    } else {
+        gpu_blur::set_activation_reveal(None);
     }
     let settings = state.settings.lock().unwrap().clone();
     overlay::update_overlay(&settings, value);
     let _ = app.emit("monocle-toggled", value);
 }
 
-fn toggle_active_with_handle<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+fn toggle_active_with_handle<R: tauri::Runtime>(app: &tauri::AppHandle<R>, source: &str) -> bool {
     let current = {
         let state = app.state::<AppState>();
         let active = state.active.lock().unwrap();
         *active
     };
-    apply_active(app, !current);
+    apply_active(app, !current, source);
     !current
 }
 
 #[tauri::command]
 fn toggle_active(app: tauri::AppHandle) -> bool {
-    toggle_active_with_handle(&app)
+    toggle_active_with_handle(&app, "ui-button")
 }
 
 #[tauri::command]
 fn set_active(app: tauri::AppHandle, value: bool) {
-    apply_active(&app, value);
+    apply_active(&app, value, "ui-set_active");
 }
 
 /// Every currently-running app the user could ignore, deduped by executable
@@ -321,11 +332,28 @@ fn set_start_on_login(enabled: bool) {
 #[cfg(not(windows))]
 fn set_start_on_login(_enabled: bool) {}
 
+/// Current cursor position in virtual-screen coordinates, for the shake
+/// activation's blur-reveal origin.
+#[cfg(windows)]
+fn cursor_pos() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt).ok()? };
+    Some((pt.x, pt.y))
+}
+
+#[cfg(not(windows))]
+fn cursor_pos() -> Option<(i32, i32)> {
+    None
+}
+
 pub fn run() {
     if !acquire_single_instance_lock() {
         return;
     }
 
+    logging::init();
     let settings = AppSettings::load();
     // Reconcile the login entry with the persisted setting on every launch, so
     // it self-heals if the exe moved or the registry value was edited.
@@ -344,8 +372,10 @@ pub fn run() {
             let toggle_i = MenuItem::with_id(app, "toggle", "Toggle Monocle", true, None::<&str>)?;
             let settings_i =
                 MenuItem::with_id(app, "settings", "Settings...", true, None::<&str>)?;
+            let logs_i =
+                MenuItem::with_id(app, "open_logs", "Open logs", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Monocle", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&toggle_i, &settings_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&toggle_i, &settings_i, &logs_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::new()
                 .tooltip("Monocle")
@@ -355,13 +385,22 @@ pub fn run() {
                     let app_handle = app.handle().clone();
                     move |_tray, event| match event.id.as_ref() {
                         "toggle" => {
-                            toggle_active_with_handle(&app_handle);
+                            toggle_active_with_handle(&app_handle, "tray-menu");
                         }
                         "settings" => {
                             if let Some(window) = app_handle.get_webview_window("settings") {
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
+                        }
+                        "open_logs" => {
+                            // Reveal the log file in Explorer so the user can
+                            // grab it when reporting a bug.
+                            let path = logging::log_path();
+                            let _ = std::process::Command::new("explorer")
+                                .arg("/select,")
+                                .arg(&path)
+                                .spawn();
                         }
                         "quit" => {
                             // Undo any shell state we changed (taskbar
@@ -383,7 +422,7 @@ pub fn run() {
                             ..
                         } = event
                         {
-                            toggle_active_with_handle(&app_handle);
+                            toggle_active_with_handle(&app_handle, "tray-click");
                         }
                     }
                 })
@@ -429,7 +468,7 @@ pub fn run() {
             let shake_handle = app.handle().clone();
             std::thread::spawn(move || {
                 shake::start_detection(move || {
-                    toggle_active_with_handle(&shake_handle);
+                    toggle_active_with_handle(&shake_handle, "shake");
                 });
             });
 

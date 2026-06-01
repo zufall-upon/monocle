@@ -50,7 +50,7 @@ const GRAIN_SATURATION: f64 = 0.55;
 const GRAIN_LIGHT: f64 = 200.0;
 const GRAIN_DARK: f64 = 35.0;
 // Max HSL colorize fraction applied to the GPU pipeline at slider 100%.
-const TINT_STRENGTH_MAX: f32 = 0.70;
+const TINT_STRENGTH_MAX: f32 = 0.50;
 
 static ALL_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -826,6 +826,18 @@ unsafe fn root_owner(hwnd: HWND) -> HWND {
     }
 }
 
+/// Short window label for the diagnostic log: `0x1234 "Title" [exe]`.
+#[cfg(windows)]
+fn win_label(hwnd_val: isize) -> String {
+    let title = unsafe {
+        let mut buf = [0u16; 96];
+        let len = GetWindowTextW(HWND(hwnd_val as *mut _), &mut buf);
+        String::from_utf16_lossy(&buf[..len.max(0) as usize])
+    };
+    let exe = crate::windows_api::exe_name_for_hwnd(hwnd_val).unwrap_or_default();
+    format!("{:#x} \"{}\" [{}]", hwnd_val, title, exe)
+}
+
 /// True if `w` sits above `root_overlay` in global z-order (i.e. it's sharp,
 /// not behind the blur). Walks downward from `w`; reaching the overlay root
 /// before the end of the chain means `w` is above it. Used to skip re-raising
@@ -1467,6 +1479,19 @@ fn foreground_tracker() {
                 let sharp_ordered: Vec<isize> = z_ordered
                     .iter().copied().filter(|h| sharp_set.contains(h)).collect();
 
+                // Record what the activation decided to keep sharp — the
+                // baseline for diagnosing an unexpectedly-sharp window.
+                {
+                    let labels: Vec<String> = sharp_ordered.iter().map(|&h| win_label(h)).collect();
+                    crate::logging::log(&format!(
+                        "activate setup: per_monitor={} app_wide={} sharp({})=[{}]",
+                        per_monitor,
+                        APP_WIDE_FOCUS.load(Ordering::Relaxed),
+                        sharp_ordered.len(),
+                        labels.join(", "),
+                    ));
+                }
+
                 // 1. Chain the sharp windows at the very top, preserving order.
                 let mut prev = HWND_TOP;
                 for &w in &sharp_ordered {
@@ -1576,6 +1601,10 @@ fn foreground_tracker() {
                     ).0 as isize;
 
                     if current_mon != *old_mon {
+                        crate::logging::log(&format!(
+                            "monitor transfer: {} {:#x} -> {:#x}",
+                            win_label(*hw), old_mon, current_mon
+                        ));
                         // Push down the destination monitor's existing group
                         if let Some(dest_group) = monitor_focused.get(&current_mon).cloned() {
                             for &dest_w in &dest_group {
@@ -1622,6 +1651,22 @@ fn foreground_tracker() {
             let monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
             let monitor_key = monitor.0 as isize;
             let new_group = focused_group(fg, &hwnds, monitor_key);
+
+            // Log the focus change and the group it sharpens. If more than one
+            // window goes sharp from a single focus, the group list shows which
+            // ones and (via app-wide focus) why — the trail for "two windows
+            // got focus when only one should".
+            {
+                let members: Vec<String> = new_group.iter().map(|&h| win_label(h)).collect();
+                crate::logging::log(&format!(
+                    "focus -> {} mon={:#x} app_wide={} group({})=[{}]",
+                    win_label(fg_val),
+                    monitor_key,
+                    APP_WIDE_FOCUS.load(Ordering::Relaxed),
+                    new_group.len(),
+                    members.join(", "),
+                ));
+            }
 
             // Push down only what *left* the un-blurred set — windows
             // that were in the previous group but aren't part of the
@@ -1893,6 +1938,9 @@ pub fn update_overlay(settings: &AppSettings, active: bool) {
     // color). The opacity slider (0..1) is scaled by TINT_STRENGTH_MAX so the
     // top of the slider lands on a tasteful colorize amount rather than a full
     // duotone.
+    // Tint dithers the chosen color over the blurred background (Dissolve
+    // blend). The opacity slider (0..1) is scaled by TINT_STRENGTH_MAX so the
+    // top of the slider lands on a 50% wash rather than a full one.
     crate::gpu_blur::set_tint(
         r as f32 / 255.0,
         g as f32 / 255.0,
