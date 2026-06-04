@@ -199,13 +199,6 @@ fn apply_active<R: tauri::Runtime>(app: &tauri::AppHandle<R>, value: bool, sourc
         return;
     }
     logging::log(&format!("active -> {} (source: {})", value, source));
-    // A shake activation sweeps the blur in from the cursor; every other
-    // source (and all deactivations) fades uniformly.
-    if value && source == "shake" {
-        gpu_blur::set_activation_reveal(cursor_pos());
-    } else {
-        gpu_blur::set_activation_reveal(None);
-    }
     let settings = state.settings.lock().unwrap().clone();
     overlay::update_overlay(&settings, value);
     let _ = app.emit("monocle-toggled", value);
@@ -331,22 +324,6 @@ fn set_start_on_login(enabled: bool) {
 
 #[cfg(not(windows))]
 fn set_start_on_login(_enabled: bool) {}
-
-/// Current cursor position in virtual-screen coordinates, for the shake
-/// activation's blur-reveal origin.
-#[cfg(windows)]
-fn cursor_pos() -> Option<(i32, i32)> {
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-    let mut pt = POINT::default();
-    unsafe { GetCursorPos(&mut pt).ok()? };
-    Some((pt.x, pt.y))
-}
-
-#[cfg(not(windows))]
-fn cursor_pos() -> Option<(i32, i32)> {
-    None
-}
 
 pub fn run() {
     if !acquire_single_instance_lock() {
