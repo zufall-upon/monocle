@@ -2,6 +2,13 @@
   "name": "monocle-win",
   "private": true,
   "version": "0.1.0",
+  "description": "A lightweight Windows focus overlay that blurs everything except what you're working on.",
+  "license": "MIT",
+  "author": "Bryce Lewis",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brycelewiswork/monocle.git"
+  },
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",

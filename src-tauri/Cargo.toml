@@ -2,6 +2,11 @@
 name = "monocle-win"
 version = "0.1.0"
 edition = "2021"
+description = "A lightweight Windows focus overlay that blurs everything except what you're working on."
+authors = ["Bryce Lewis"]
+license = "MIT"
+repository = "https://github.com/brycelewiswork/monocle"
+homepage = "https://github.com/brycelewiswork/monocle"
 
 [lib]
 name = "monocle_lib"

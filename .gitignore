@@ -25,5 +25,5 @@ build/
 # Edit cruft
 *.tmp.*
 
-# Local Claude settings
-.claude/settings.local.json
+# Local Claude Code state (per-user, not project config)
+.claude/
