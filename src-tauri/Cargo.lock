@@ -509,6 +509,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "deep"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-global-shortcut",
+ "windows",
+ "windows-numerics",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1794,20 +1808,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "monocle-win"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-global-shortcut",
- "windows",
- "windows-numerics",
 ]
 
 [[package]]

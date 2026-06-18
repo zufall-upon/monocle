@@ -59,7 +59,7 @@ static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 // Bounded — drops oldest on overflow. On full deactivate we BringWindowToTop
 // each one, undoing the z-order debt the tracker accumulated. Without this,
 // long sessions leave a graveyard of windows stuck at the bottom of z-order
-// that the user can't easily raise after Monocle is turned off.
+// that the user can't easily raise after Deep is turned off.
 static PUSHED_DOWN: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 const MAX_PUSHED: usize = 256;
 
@@ -82,7 +82,7 @@ static IGNORED_EXES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 // Sentinel key for the ignored-app group in the focus-rect map. Real keys are
 // HMONITOR handles (always positive), so -1 never collides.
 const IGNORED_FOCUS_KEY: isize = -1;
-// User setting: while Monocle is active, switch the Windows taskbar into real
+// User setting: while Deep is active, switch the Windows taskbar into real
 // OS auto-hide (it slides off-screen and reappears on edge-hover), rather than
 // blurring it in place. Named `blur_taskbar` for settings back-compat.
 static BLUR_TASKBAR: AtomicBool = AtomicBool::new(false);
@@ -93,7 +93,7 @@ static TASKBAR_AUTOHIDDEN: AtomicBool = AtomicBool::new(false);
 // The taskbar's appbar state (ABS_* bitmask) captured right before we forced
 // auto-hide, so we can restore it precisely instead of guessing the default.
 static SAVED_TASKBAR_STATE: AtomicI32 = AtomicI32::new(0);
-// User setting: hide the desktop icons while Monocle is active.
+// User setting: hide the desktop icons while Deep is active.
 static HIDE_DESKTOP_ICONS: AtomicBool = AtomicBool::new(false);
 // True while WE have hidden the desktop icons. Tracks our own action so
 // deactivation (or toggling the setting off mid-session) only re-shows them
@@ -749,7 +749,7 @@ unsafe fn set_taskbar_autohide(enable: bool) {
     }
 }
 
-/// Restore any shell state Monocle changed (taskbar auto-hide, desktop icons).
+/// Restore any shell state Deep changed (taskbar auto-hide, desktop icons).
 /// Called on quit, where the deactivate fade path that normally reverts these
 /// never runs.
 #[cfg(windows)]
@@ -794,7 +794,7 @@ unsafe fn find_desktop_defview() -> Option<HWND> {
 /// `ShowWindow`. This is deliberately NOT the shell's 0x7402 "Show desktop
 /// icons" command: that command flips a *persistent* user setting and plays
 /// Explorer's ~1s fade-in animation on show. ShowWindow is instant in both
-/// directions and leaves the persistent setting alone, so if Monocle ever dies
+/// directions and leaves the persistent setting alone, so if Deep ever dies
 /// mid-session Explorer just repaints the icons rather than leaving them stuck
 /// hidden. The per-tick reassert in the tracker re-hides them if Explorer
 /// repaints while we want them gone. Idempotent: only acts when the list view's
@@ -1146,7 +1146,7 @@ pub fn init() {
             create_noise_bitmap();
 
             let hinstance = GetModuleHandleW(None).unwrap();
-            let class_name = windows::core::w!("MonocleOverlay");
+            let class_name = windows::core::w!("DeepOverlay");
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(overlay_wnd_proc),
@@ -1187,7 +1187,7 @@ pub fn init() {
                 };
                 let hwnd = CreateWindowExW(
                     ex_style,
-                    class_name, windows::core::w!("MonocleOverlay"),
+                    class_name, windows::core::w!("DeepOverlay"),
                     WS_POPUP, sx, sy, sw, sh,
                     owner, None, Some(hinstance.into()), None,
                 ).expect("Failed to create overlay window");
@@ -1297,7 +1297,7 @@ fn foreground_tracker() {
                             // here is what made them reshuffle on deactivate.
                             PUSHED_DOWN.lock().unwrap().clear();
                             // If we forced the taskbar into auto-hide, put it
-                            // back the way the user had it now that Monocle is
+                            // back the way the user had it now that Deep is
                             // off.
                             set_taskbar_autohide(false);
                             // Bring desktop icons back once the overlay has
@@ -1393,7 +1393,7 @@ fn foreground_tracker() {
             }
 
             // Keep our settings window above the overlay (and everything else)
-            // every tick so it's always usable for tuning while Monocle is
+            // every tick so it's always usable for tuning while Deep is
             // active, regardless of which app the user focuses. It's excluded
             // from the focus engine entirely (is_eligible_window rejects it),
             // so this is the only thing that positions it.
@@ -1759,7 +1759,7 @@ fn foreground_tracker() {
                     // would reorder it relative to its peers — visible as the
                     // app's other windows reshuffling when one opens or gains
                     // focus. Leaving sharp windows untouched preserves the
-                    // z-order they had when Monocle turned on.
+                    // z-order they had when Deep turned on.
                     if IsWindow(Some(hw)).as_bool()
                         && !is_above_overlay(hw, root_overlay)
                     {

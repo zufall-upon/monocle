@@ -71,7 +71,7 @@ mod imp {
         }
 
         let hinstance = GetModuleHandleW(None).unwrap();
-        let class_name = w!("MonocleMagHost");
+        let class_name = w!("DeepMagHost");
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(host_wnd_proc),
@@ -93,7 +93,7 @@ mod imp {
         let host = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name,
-            w!("MonocleMagnifier"),
+            w!("DeepMagnifier"),
             WS_POPUP,
             sx, sy, sw, sh,
             None,

@@ -362,7 +362,7 @@ mod imp {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
 
         let hinstance = GetModuleHandleW(None).unwrap();
-        let class_name = w!("MonocleGpuBlur");
+        let class_name = w!("DeepGpuBlur");
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wnd_proc),
@@ -387,7 +387,7 @@ mod imp {
                 | WS_EX_NOACTIVATE
                 | WS_EX_TRANSPARENT,
             class_name,
-            w!("MonocleGpuBlur"),
+            w!("DeepGpuBlur"),
             WS_POPUP,
             x,
             y,
@@ -687,7 +687,7 @@ mod imp {
         // Fully idle: overlay off and faded out. WGC keeps firing FrameArrived
         // on every screen change regardless of our state, so without this we'd
         // run a full-screen GPU copy + present per monitor on each change even
-        // while Monocle is disabled. Drain & discard the frames cheaply and
+        // while Deep is disabled. Drain & discard the frames cheaply and
         // bail before any real work.
         if !ACTIVE.load(Ordering::Relaxed) && fade() <= 0.0 {
             while let Ok(frame) = rs.framepool.TryGetNextFrame() {
@@ -1014,7 +1014,7 @@ mod imp {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(std::env::temp_dir().join("monocle-gpu-blur.log"))
+            .open(std::env::temp_dir().join("deep-gpu-blur.log"))
         {
             let _ = writeln!(f, "{s}");
         }

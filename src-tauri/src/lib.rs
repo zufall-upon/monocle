@@ -184,7 +184,7 @@ fn toggle_active_with_handle_action<R: tauri::Runtime>(app: &tauri::AppHandle<R>
 /// Single chokepoint for changing the active state. Every toggle/set
 /// entry point (UI button, tray menu, tray icon, shake) goes through
 /// this so the active mutex, the overlay's internal state, and the UI
-/// (via the monocle-toggled event) can never disagree. `source` is logged
+/// (via the deep-toggled event) can never disagree. `source` is logged
 /// so an unexpected activation can be traced back to what triggered it.
 fn apply_active<R: tauri::Runtime>(app: &tauri::AppHandle<R>, value: bool, source: &str) {
     let state = app.state::<AppState>();
@@ -201,7 +201,7 @@ fn apply_active<R: tauri::Runtime>(app: &tauri::AppHandle<R>, value: bool, sourc
     logging::log(&format!("active -> {} (source: {})", value, source));
     let settings = state.settings.lock().unwrap().clone();
     overlay::update_overlay(&settings, value);
-    let _ = app.emit("monocle-toggled", value);
+    let _ = app.emit("deep-toggled", value);
 }
 
 fn toggle_active_with_handle<R: tauri::Runtime>(app: &tauri::AppHandle<R>, source: &str) -> bool {
@@ -238,7 +238,7 @@ fn get_foreground_app() -> Option<settings::IgnoredApp> {
     windows_api::foreground_app()
 }
 
-/// Acquire a named mutex so only one Monocle process can run at a time.
+/// Acquire a named mutex so only one Deep process can run at a time.
 /// Returns true if we got the lock (first instance), false if another
 /// instance already holds it. The HANDLE is intentionally leaked — the
 /// kernel releases it on process exit, which is exactly when we want
@@ -252,7 +252,7 @@ fn acquire_single_instance_lock() -> bool {
     use windows::Win32::System::Threading::CreateMutexW;
 
     unsafe {
-        match CreateMutexW(None, true, w!("Local\\MonocleSingleInstance")) {
+        match CreateMutexW(None, true, w!("Local\\DeepSingleInstance")) {
             Ok(_handle) => GetLastError() != ERROR_ALREADY_EXISTS,
             // If the kernel can't even create a mutex, fall through and
             // allow the launch — failing closed here would lock the user
@@ -267,7 +267,7 @@ fn acquire_single_instance_lock() -> bool {
     true
 }
 
-/// Register or unregister Monocle to launch at user login by writing (or
+/// Register or unregister Deep to launch at user login by writing (or
 /// deleting) a value under HKCU\...\CurrentVersion\Run. Per-user, so it
 /// needs no elevation; the value points at the current executable, so it
 /// self-corrects if the binary moves and the setting is re-applied.
@@ -313,10 +313,10 @@ fn set_start_on_login(enabled: bool) {
                 value.as_ptr() as *const u8,
                 value.len() * std::mem::size_of::<u16>(),
             );
-            let _ = RegSetValueExW(hkey, w!("Monocle"), None, REG_SZ, Some(bytes));
+            let _ = RegSetValueExW(hkey, w!("Deep"), None, REG_SZ, Some(bytes));
         } else {
             // Deleting a missing value returns an error we intentionally ignore.
-            let _ = RegDeleteValueW(hkey, w!("Monocle"));
+            let _ = RegDeleteValueW(hkey, w!("Deep"));
         }
         let _ = RegCloseKey(hkey);
     }
@@ -346,17 +346,23 @@ pub fn run() {
         .manage(state.clone())
         .setup(move |app| {
             // Build system tray
-            let toggle_i = MenuItem::with_id(app, "toggle", "Toggle Monocle", true, None::<&str>)?;
+            let toggle_i = MenuItem::with_id(app, "toggle", "Toggle Deep", true, None::<&str>)?;
             let settings_i =
                 MenuItem::with_id(app, "settings", "Settings...", true, None::<&str>)?;
             let logs_i =
                 MenuItem::with_id(app, "open_logs", "Open logs", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit Monocle", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit Deep", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&toggle_i, &settings_i, &logs_i, &quit_i])?;
 
-            let _tray = TrayIconBuilder::new()
-                .tooltip("Monocle")
-                .menu(&menu)
+            let mut tray = TrayIconBuilder::new()
+                .tooltip("Deep")
+                .menu(&menu);
+            // Show the app icon in the tray. Falls back gracefully if no
+            // default window icon is configured.
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray = tray.icon(icon);
+            }
+            let _tray = tray
                 .show_menu_on_left_click(false)
                 .on_menu_event({
                     let app_handle = app.handle().clone();
@@ -464,5 +470,5 @@ pub fn run() {
             get_foreground_app,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Monocle");
+        .expect("error while running Deep");
 }

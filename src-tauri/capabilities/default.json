@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Monocle default capabilities",
+  "description": "Deep default capabilities",
   "windows": ["settings"],
   "permissions": [
     "core:default",

@@ -43,7 +43,7 @@ pub struct AppSettings {
     #[serde(default)]
     pub app_wide_focus: bool,
     pub blur_taskbar: bool,
-    // Hide the desktop icons while Monocle is active (restored on deactivate).
+    // Hide the desktop icons while Deep is active (restored on deactivate).
     // Driven through the shell's "Show desktop icons" toggle, not a registry
     // edit, so it takes effect instantly and reverses cleanly.
     #[serde(default)]
@@ -94,7 +94,7 @@ impl AppSettings {
     fn config_path() -> std::path::PathBuf {
         let dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("Monocle");
+            .join("Deep");
         std::fs::create_dir_all(&dir).ok();
         dir.join("settings.json")
     }

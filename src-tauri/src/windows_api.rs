@@ -28,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// Our own executable — skipped when listing/identifying apps so the overlay
 /// windows and the settings window (all in this process) never appear.
-const SELF_EXE: &str = "monocle-win.exe";
+const SELF_EXE: &str = "deep.exe";
 
 fn file_name_lower(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()

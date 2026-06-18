@@ -8,7 +8,7 @@ async function init() {
   settings = await invoke("get_settings");
   applySettingsToUI(settings);
 
-  listen("monocle-toggled", (event) => {
+  listen("deep-toggled", (event) => {
     updateStatusUI(event.payload);
   });
 

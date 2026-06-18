@@ -40,7 +40,7 @@ struct ShakeState {
     // whole shake took (a very short span hints at an accidental trigger).
     chain_start: Instant,
     // After a trigger we ignore movement until this instant, so the tail of the
-    // same shake (or an immediate second shake) can't toggle Monocle back.
+    // same shake (or an immediate second shake) can't toggle Deep back.
     cooldown_until: Instant,
 }
 
@@ -57,18 +57,21 @@ const SHAKE_TIME_WINDOW_MS: u128 = 600;
 const SHAKE_COOLDOWN: Duration = Duration::from_millis(900);
 
 // Minimum horizontal travel (px) for a move to count toward a reversal. Driven
-// by the sensitivity slider via `set_sensitivity`; bigger = a wider, more
-// deliberate swing is required. Defaults to the midpoint (slider 0.5).
-static SHAKE_MIN_DELTA: AtomicI32 = AtomicI32::new(57);
+// by the shake slider via `set_sensitivity`; bigger = a wider, more deliberate
+// swing is required. Defaults to the midpoint (slider 0.5) until settings load.
+static SHAKE_MIN_DELTA: AtomicI32 = AtomicI32::new(175);
 
-// Map the 0..1 sensitivity slider to the required swing distance. Right/high =
-// easy (short swing); left/low = deliberate (long swing). Inverse: more
-// sensitivity means a smaller distance threshold.
-pub fn set_sensitivity(sensitivity: f64) {
-    const DELTA_AT_MIN_SENS: f64 = 90.0; // slider 0.0 → must travel far
-    const DELTA_AT_MAX_SENS: f64 = 25.0; // slider 1.0 → small swing triggers
-    let s = sensitivity.clamp(0.0, 1.0);
-    let delta = (DELTA_AT_MIN_SENS - s * (DELTA_AT_MIN_SENS - DELTA_AT_MAX_SENS)).round() as i32;
+// Map the 0..1 shake slider to the required per-swing travel distance (px).
+// The slider reads as "how hard to trigger": LEFT = easy (a small flick
+// toggles), RIGHT = hard (only a big, vigorous shake toggles). At max-right the
+// swings must be so wide — and, since SHAKE_REVERSALS_NEEDED of them must land
+// within SHAKE_TIME_WINDOW_MS of each other, so fast — that ordinary
+// back-and-forth mouse motion can't toggle Deep by accident.
+pub fn set_sensitivity(slider: f64) {
+    const DELTA_AT_EASY: f64 = 30.0; // slider 0.0 → a small swing triggers
+    const DELTA_AT_HARD: f64 = 320.0; // slider 1.0 → must swing far, fast, repeatedly
+    let s = slider.clamp(0.0, 1.0);
+    let delta = (DELTA_AT_EASY + s * (DELTA_AT_HARD - DELTA_AT_EASY)).round() as i32;
     SHAKE_MIN_DELTA.store(delta, Ordering::Relaxed);
 }
 
@@ -100,7 +103,7 @@ unsafe extern "system" fn mouse_hook_proc(
 
             // In the post-trigger quiet period: keep tracking position so dx
             // stays sane, but don't accumulate reversals — the tail of the
-            // shake that just fired must not toggle Monocle straight back.
+            // shake that just fired must not toggle Deep straight back.
             if now < state.cooldown_until {
                 state.reversals = 0;
                 state.last_dir = dir;

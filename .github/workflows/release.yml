@@ -48,7 +48,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "Monocle ${{ github.ref_name }}"
+          releaseName: "Deep ${{ github.ref_name }}"
           releaseBody: "Download the `*-setup.exe` (NSIS) or `*.msi` installer below. The build is unsigned — on first run, click **More info -> Run anyway** past Windows SmartScreen."
           releaseDraft: false
           prerelease: false
