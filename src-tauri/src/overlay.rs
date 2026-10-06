@@ -16,6 +16,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+static DIVIDER_FALLBACK_BLOCKED: AtomicBool = AtomicBool::new(false);
 const BLUR_LAYERS: usize = 1;
 // Ownership chain (bottom to top):
 // [0]=transparent anchor, [1]=tint, [2]=grain
@@ -829,6 +830,7 @@ fn focus_diagnostics() -> String {
         let mut out=format!("per_monitor={} app_wide={} static={} foreground={:#x} root={root:#x}\n",
             OVERLAY_PER_MONITOR.load(Ordering::Relaxed),APP_WIDE_FOCUS.load(Ordering::Relaxed),
             STATIC_MASK.load(Ordering::Relaxed),GetForegroundWindow().0 as isize);
+        out.push_str(&format!("divider_fallback_blocked={}\n",DIVIDER_FALLBACK_BLOCKED.load(Ordering::Relaxed)));
         out.push_str(&crate::placement_trace::report());
         let trace=FOCUS_TRACE.lock().unwrap().clone();
         let ignored=IGNORED_CONFIG.lock().unwrap().clone();
@@ -1038,6 +1040,7 @@ unsafe fn reconcile_focus(groups: &mut HashMap<isize,Vec<isize>>, hwnds: &[isize
     // A successful SetWindowPos need not put the foreign HWND below us. Move
     // only our divider, and only if all sharp/ignored windows can remain above
     // it. One relocation per reconciliation; remaining targets follow next tick.
+    if DIVIDER_FALLBACK_BLOCKED.load(Ordering::Relaxed) {return;}
     let protected:Vec<_>=sharp.iter().chain(ignored.iter()).copied()
         .filter(|&id|IsWindowVisible(HWND(id as *mut _)).as_bool() && !IsIconic(HWND(id as *mut _)).as_bool()).collect();
     for id in targets {
@@ -1046,6 +1049,11 @@ unsafe fn reconcile_focus(groups: &mut HashMap<isize,Vec<isize>>, hwnds: &[isize
         if !is_effect_target(target) || !is_above_overlay(target,root) {continue;}
         let result=crate::window_order::raise_divider_above(target,root,hwnds,&protected);
         crate::placement_trace::divider_result(id,&result);
+        if result.is_err() {
+            DIVIDER_FALLBACK_BLOCKED.store(true,Ordering::Relaxed);
+            NEEDS_INITIAL_SETUP.store(true,Ordering::Release);
+            break;
+        }
         if matches!(result,Ok(true)) {
             crate::gpu_blur::reassert_z(hwnds[BLUR_LAYERS-1]);
             break;
@@ -1859,6 +1867,7 @@ unsafe extern "system" fn overlay_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
 
 #[cfg(windows)]
 pub fn update_overlay(settings: &AppSettings, active: bool) {
+    DIVIDER_FALLBACK_BLOCKED.store(false,Ordering::Relaxed);
     let live = crate::renderer_policy::is_live(&settings.effect_renderer);
     STATIC_MASK.store(!live, Ordering::Relaxed);
     MASK_PATTERN.store(match settings.mask_pattern.as_str() { "stripes" => 1, "grid" => 2, _ => 0 }, Ordering::Relaxed);

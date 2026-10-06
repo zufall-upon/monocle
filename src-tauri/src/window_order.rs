@@ -38,7 +38,14 @@ pub unsafe fn raise_divider_above(target:HWND,root:HWND,visuals:&[isize],protect
     lower_window(root,insert)?;
     let safe=above(root,target)==Some(true) && protected.iter().all(|&id|
         visuals.iter().all(|&visual|above(HWND(id as *mut _),HWND(visual as *mut _))==Some(true)));
-    if !safe {lower_window(root,restore)?;}
+    if !safe {
+        let restored=lower_window(root,restore);
+        let verified=above(target,root)==Some(true) && protected.iter().all(|&id|
+            visuals.iter().all(|&visual|above(HWND(id as *mut _),HWND(visual as *mut _))==Some(true)));
+        if restored.is_err() || !verified {
+            return Err(windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),"divider restoration not verified"));
+        }
+    }
     Ok(safe)
 }
 
@@ -47,8 +54,13 @@ mod tests {
     use super::*;
     use windows::{core::w,Win32::{Foundation::*,System::{LibraryLoader::GetModuleHandleW,Threading::GetCurrentThreadId}}};
     unsafe extern "system" fn proc(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT {
-        if m==WM_WINDOWPOSCHANGING && GetWindowLongPtrW(h,GWLP_USERDATA)==1 {
-            (*(l.0 as *mut WINDOWPOS)).flags |= SWP_NOZORDER;
+        if m==WM_WINDOWPOSCHANGING {
+            let mode=GetWindowLongPtrW(h,GWLP_USERDATA);
+            if mode==1 { (*(l.0 as *mut WINDOWPOS)).flags |= SWP_NOZORDER; }
+            if mode==2 || mode==3 {
+                (*(l.0 as *mut WINDOWPOS)).hwndInsertAfter=HWND_TOP;
+                if mode==2 {SetWindowLongPtrW(h,GWLP_USERDATA,0);}
+            }
         }
         DefWindowProcW(h,m,w,l)
     }
@@ -102,6 +114,13 @@ mod tests {
             lower_window(HWND(rebound_id as *mut _),root).unwrap();
             let declined=raise_divider_above(target,root,&visuals,&[active.0 as isize,rebound_id]).unwrap();
             let still_above=above(target,root);
+            SetWindowLongPtrW(root,GWLP_USERDATA,2);
+            let rolled_back=raise_divider_above(target,root,&visuals,&[active.0 as isize]).unwrap();
+            let rollback_verified=above(target,root)==Some(true) && above(active,grain)==Some(true);
+            SetWindowLongPtrW(root,GWLP_USERDATA,3);
+            let failed_restore=raise_divider_above(target,root,&visuals,&[active.0 as isize]);
+            SetWindowLongPtrW(root,GWLP_USERDATA,0);
+            lower_window(root,target).unwrap();
             let repaired=raise_divider_above(target,root,&visuals,&[active.0 as isize]).unwrap();
             for g in gpu {lower_window(g,root).unwrap();}
             let all_below=gpu.iter().all(|g|above(target,*g)==Some(false));
@@ -128,6 +147,7 @@ mod tests {
             for g in gpu {let _=DestroyWindow(g);}
             let _=DestroyWindow(grain);let _=DestroyWindow(tint);let _=DestroyWindow(root);let _=DestroyWindow(active);
             assert!(!declined);assert_eq!(still_above,Some(true));
+            assert!(!rolled_back && rollback_verified);assert!(failed_restore.is_err());
             assert!(repaired && all_below && sharp_ok && input_ok && foreground_ok && root_normal,"divider fallback must preserve sharp/input/activation/band");
             assert_eq!(initial,Some(true)); assert!(result.is_ok()); assert_eq!(unchanged,Some(true));
             assert!(report.contains("fixture-reject-zorder") && report.contains("result=ok"));

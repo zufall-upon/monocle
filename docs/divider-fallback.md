@@ -18,7 +18,11 @@ Safeguards:
 - Skip our owned visual windows when selecting the insertion point. Use HWND_TOP
   at the normal-band boundary; do not use HWND_TOPMOST.
 - Check the resulting root and protected-window ordering. If invalid, attempt to
-  restore the prior divider slot. One successful relocation per reconciliation.
+  restore the prior divider slot and verify the background/protected relations.
+  On an API/restoration error, stop fallback retries until an explicit settings/
+  activation update and request ordinary setup reconciliation. Diagnostics expose
+  the blocked state; this does not promise atomic desktop restoration. One
+  successful relocation per reconciliation.
 - Never activate a window or change another application's style/owner. Existing
   input passthrough remains intact.
 
@@ -27,7 +31,9 @@ with root/tint/grain ownership and three GPU-style windows. It verifies a protec
 anchor below the target prevents relocation, then verifies that the unprotected
 refusing background falls below all GPU windows while the focused app stays above,
 foreground stays unchanged, the root stays non-topmost, and visual windows do not
-become the input target. The existing opaque DComp input fixture remains required.
+become the input target. It also forces a postcondition failure, tests verified
+rollback, and tests that unverified rollback returns an error. The existing opaque
+DComp input fixture remains required.
 
 This remains a preview: actual Firefox and three physical monitors are unverified.
 A safe refusal is possible with incompatible retained/ignored ordering. Desktop
