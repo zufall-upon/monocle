@@ -1,7 +1,7 @@
 //! Lightweight always-on file logging for catching field bugs. Records the
 //! events that have actually bitten us — activation triggers (with their
 //! source), shake fires (with timing), and focus changes (with the computed
-//! sharp group) — to %APPDATA%\Deep\deep.log. The file is rotated to
+//! sharp group) — to %APPDATA%\DeepLite\deep-lite.log. The file is rotated to
 //! `.old` once when it grows past a couple of megabytes, so it never grows
 //! unbounded but recent history is always available.
 
@@ -14,28 +14,29 @@ static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Full path to the active log file (next to settings.json).
+pub(crate) fn log_path_at(config_root: &std::path::Path) -> PathBuf {
+    crate::identity::data_dir_at(config_root).join("deep-lite.log")
+}
+
 pub fn log_path() -> PathBuf {
-    let dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Deep");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("deep.log")
+    log_path_at(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
 }
 
 /// Open the log for appending, rotating it first if it's gotten large. Call
 /// once at startup.
 pub fn init() {
     let path = log_path();
+    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
     if std::fs::metadata(&path)
         .map(|m| m.len() > MAX_LOG_BYTES)
         .unwrap_or(false)
     {
-        let _ = std::fs::rename(&path, path.with_file_name("deep.log.old"));
+        let _ = std::fs::rename(&path, path.with_file_name("deep-lite.log.old"));
     }
     if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
         *LOG_FILE.lock().unwrap() = Some(file);
     }
-    log(&format!("=== Deep v{} started ===", env!("CARGO_PKG_VERSION")));
+    log(&format!("=== Deep Lite v{} started ===", env!("CARGO_PKG_VERSION")));
 }
 
 /// Append one timestamped line. Flushes immediately so the log survives a

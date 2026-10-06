@@ -1,8 +1,8 @@
 # Low-GPU blur experiment
 
-This fork keeps Deep and Ambient blur, tint, desaturation, grain, the existing
-settings UI and window focus tracker. It is an experimental source build, not a
-measured or Windows-validated release. Upstream: brycelewiswork/monocle,
+Deep Lite keeps Deep and Ambient blur, tint, desaturation, grain, the existing
+settings UI and window focus tracker. It is an experimental build, not a GPU-measured or Windows-runtime-validated
+release. Upstream: brycelewiswork/monocle,
 base commit `a1060b30c40f127b9796d7aed7eb3b9c4f6f7692` (MIT, Bryce Lewis).
 
 ## What changed
@@ -84,28 +84,48 @@ between pure policy and the Windows renderer. API signatures were checked agains
 windows 0.61.3/windows-core 0.61.2 source. The null-frame conversion is compared with `Error::empty().code()`, not
 an assumed E_POINTER HRESULT.
 
-Rust/MSVC/Windows SDK are not installed on this host. New toolchain/binary
-installation and executing the app require approval. No app process was stopped,
-installed, overwritten or launched. The manual Windows build workflow is prepared
-but has not been run. A successful future build would not establish visual or GPU
-correctness.
+Windows build/test/package execution is authorized on standard GitHub-hosted
+Windows runners for this public repository. The earlier `4a6c844` source compiled,
+passed all 10 blur-policy tests and packaged successfully in [run 37416035835](https://github.com/zufall-upon/monocle/actions/runs/37416035835).
+That build was not isolated from upstream settings and must not be used as the
+recommended preview. The isolated Deep Lite prerelease links its own successful
+CI run and exact SHA. No SDK was installed on the Ubuntu editing host, and no
+user-PC app was stopped, installed, overwritten or launched.
 
-`src-tauri/src/blur_policy.rs` now contains 10 unit tests, **prepared but not run**.
-They cover static-frame reuse and settings updates; missing/failed/overtaken
-presentation; fade-out and fresh-frame restart; rapid toggling; zero-blur with
-other effects; content/texture resize rejection; independent monitor state;
-physical sigma and exact half dimensions; weak/odd/invalid quality fallback; and
-Deep-versus-Ambient branch selection. These functions are used by the Windows
-renderer, rather than being a separate simulation of its intended behavior.
-The manual workflow rejects discovery of fewer than these 10 policy tests before
-running the library tests. Passing them would validate policy only, not WGC,
-Direct2D execution, 20 Hz timing, visual quality or hardware lifecycle.
+`src-tauri/src/blur_policy.rs` contains 10 unit tests covering static-frame reuse,
+settings updates, failed/overtaken presentation, fade-out/restart, rapid toggling,
+zero-blur with other effects, resize rejection, independent monitors, sigma and
+half dimensions, quality fallback and mode selection. Six further isolation
+tests cover installer identity, default autostart behavior, shared log/settings
+location, old-settings preservation/non-migration, filename-independent PID
+identity, and the Windows shared mutex. The file-preservation test only creates
+its own temporary fixture; the mutex test runs only inside the CI test process.
+
+The manual workflow refuses fewer than 10 policy or 6 isolation tests before
+running the library tests. Passing them does not verify WGC/Direct2D execution,
+20 Hz timing, visual quality, installer behavior on a user machine, or GPU savings.
+
+## Isolation from upstream Deep
+
+Deep Lite uses `%APPDATA%\DeepLite`, a `DeepLite` Run value, product `Deep Lite`,
+identifier `io.github.zufallupon.deeplite`, and installed binary `deep-lite.exe`.
+Its GPU diagnostic log is `%TEMP%\deep-lite-gpu-blur.log`. Upstream settings are
+not imported, including when the fork's settings are absent or invalid. Fresh
+settings keep autostart OFF and startup performs no Run-key reconciliation in
+that state. Later explicit changes or an existing opt-in affect only DeepLite.
+
+The upstream mutex is deliberately retained to block simultaneous overlays
+before settings/log/autostart work. Failure to create that mutex also prevents
+startup. Neither app is stopped by the fork. Executable self-exclusion uses PID,
+so renaming a standalone binary does not change which process is considered self.
+See README and each package's BUILD-INFO for the installation/runtime limitations.
 
 ## Windows acceptance matrix — all runtime cases pending
 
-Use a separately approved test machine/session. Do not replace or run alongside
-an existing Deep installation: this fork retains upstream app/config identities,
-window classes and hotkeys. Keep the existing settings and installation intact.
+Use a separately approved test machine/session. Keep the existing Deep settings
+and installation intact. The isolated preview has its own settings/install identity
+and deliberately refuses a second concurrent overlay through the shared mutex.
+A user-machine install or launch still requires separate authorization.
 
 | Case | Expected check |
 | --- | --- |

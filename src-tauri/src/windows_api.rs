@@ -26,9 +26,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WS_EX_TOOLWINDOW, WS_VISIBLE,
 };
 
-/// Our own executable — skipped when listing/identifying apps so the overlay
-/// windows and the settings window (all in this process) never appear.
-const SELF_EXE: &str = "deep.exe";
+// A renamed standalone executable is still this process. Other processes
+// with the same filename are not this application.
+fn is_own_process(pid: u32) -> bool {
+    pid != 0 && pid == std::process::id()
+}
 
 fn file_name_lower(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
@@ -192,9 +194,12 @@ unsafe extern "system" fn list_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
 #[cfg(windows)]
 fn resolve_app(hwnd: isize) -> Option<IgnoredApp> {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid)); }
+    if pid == 0 || is_own_process(pid) { return None; }
     let path = exe_path_for_hwnd(hwnd)?;
     let exe = file_name_lower(&path);
-    if exe.is_empty() || exe == SELF_EXE {
+    if exe.is_empty() {
         return None;
     }
     Some(IgnoredApp {
@@ -249,4 +254,15 @@ pub fn list_app_windows() -> Vec<IgnoredApp> {
 #[cfg(not(windows))]
 pub fn foreground_app() -> Option<IgnoredApp> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn self_identity_uses_pid_even_when_the_executable_is_renamed() {
+        let own = std::process::id();
+        assert!(super::is_own_process(own));
+        assert!(!super::is_own_process(0));
+        assert!(!super::is_own_process(own.wrapping_add(1)));
+    }
 }

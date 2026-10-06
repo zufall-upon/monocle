@@ -1184,7 +1184,7 @@ mod imp {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(std::env::temp_dir().join("deep-gpu-blur.log"))
+            .open(std::env::temp_dir().join("deep-lite-gpu-blur.log"))
         {
             let _ = writeln!(f, "{s}");
         }

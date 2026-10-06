@@ -91,26 +91,58 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
-    fn config_path() -> std::path::PathBuf {
-        let dir = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("Deep");
-        std::fs::create_dir_all(&dir).ok();
-        dir.join("settings.json")
-    }
-
-    pub fn load() -> Self {
-        let path = Self::config_path();
-        std::fs::read_to_string(&path)
+    fn load_from_dir(dir: &std::path::Path) -> Self {
+        // Only the provided fork directory is read. No legacy fallback.
+        std::fs::read_to_string(dir.join("settings.json"))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
 
-    pub fn save(&self) {
-        let path = Self::config_path();
+    fn save_to_dir(&self, dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).ok();
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            std::fs::write(path, json).ok();
+            std::fs::write(dir.join("settings.json"), json).ok();
         }
+    }
+
+    pub fn load() -> Self {
+        Self::load_from_dir(&crate::identity::data_dir())
+    }
+
+    pub fn save(&self) {
+        self.save_to_dir(&crate::identity::data_dir());
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_settings_are_neither_imported_nor_modified() {
+        let root = std::env::temp_dir().join(format!("deep-lite-isolation-test-{}", std::process::id()));
+        assert!(!root.exists(), "test fixture path must be new");
+        let legacy = root.join("Deep");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let mut upstream = AppSettings::default();
+        upstream.start_on_login = true;
+        upstream.gpu_blur_intensity = 0.91;
+        let original = serde_json::to_string(&upstream).unwrap();
+        std::fs::write(legacy.join("settings.json"), &original).unwrap();
+        let fork = crate::identity::data_dir_at(&root);
+        let mut fresh = AppSettings::load_from_dir(&fork);
+        assert!(!fresh.start_on_login);
+        assert_eq!(fresh.gpu_blur_intensity, default_gpu_blur_intensity());
+        assert!(!fork.exists(), "loading defaults must not migrate/create data");
+        fresh.gpu_blur_intensity = 0.42;
+        fresh.save_to_dir(&fork);
+        assert_eq!(AppSettings::load_from_dir(&fork).gpu_blur_intensity, 0.42);
+        assert_eq!(std::fs::read_to_string(legacy.join("settings.json")).unwrap(), original);
+        std::fs::write(fork.join("settings.json"), "invalid json").unwrap();
+        assert!(!AppSettings::load_from_dir(&fork).start_on_login);
+        assert_eq!(std::fs::read_to_string(legacy.join("settings.json")).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

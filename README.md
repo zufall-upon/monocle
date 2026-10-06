@@ -1,139 +1,86 @@
-> **Experimental low-GPU fork:** Background blur updates are budgeted to 20/s,
-> with capture suspension while disabled and cached-frame reuse. Strong Deep
-> blur uses half-size effect bitmaps; weak Deep blur and Ambient retain the native
-> path. Windows runtime behavior and GPU savings have not yet been measured. See [implementation and validation status](docs/low-gpu-blur.md).
-> The Install links below are upstream releases, not binaries from this fork.
+# Deep Lite
 
-<div align="center">
+An experimental low-GPU fork of [Deep / Monocle](https://github.com/brycelewiswork/monocle)
+by Bryce Lewis. Keeps background blur, focus tracking, tint, grain and the settings
+UI on Windows 10/11 x64. Upstream's MIT license is retained in [LICENSE](LICENSE).
 
-# Deep
+**Windows compilation and policy tests do not establish GPU savings or runtime
+quality.** Three-monitor behavior, visual quality and GPU/power measurements still
+need validation. See [implementation and validation notes](docs/low-gpu-blur.md).
 
-**A lightweight Windows focus overlay that blurs everything except what you're working on.**
+## What changed
 
-When Deep is active, your whole screen is gently blurred, tinted, and grained —
-except the window you're focused on, which stays crisp. It's a calm, distraction-free
-"spotlight" for whatever has your attention. Lives in the system tray, toggles with a
-hotkey or a quick shake of the mouse.
+- Budget background blur updates to 20 per second; reuse unchanged frames.
+- Close capture after deactivation fades out; reopen on activation.
+- Strong Deep blur uses half-width/half-height effect bitmaps. Weak blur and odd
+  monitor dimensions use the original full-resolution path.
+- Ambient keeps its sharp base and eight native-resolution blur bands.
+- Rebuild monitor resources on display changes and resume.
 
-Built with [Tauri 2](https://tauri.app) (Rust + WebView). Windows 10/11, x64.
+Deep's existing per-monitor/app-wide focus, ignored apps, desaturation, tint,
+grain, shake toggle, fades and configurable hotkeys remain available.
 
-<!-- TODO: drop a screenshot or GIF of the settings window + the overlay in action here, e.g.
-     ![Deep](docs/screenshot.png) -->
+## Download the isolated preview
 
-</div>
+Use a **Deep Lite** prerelease from [this fork's Releases](https://github.com/zufall-upon/monocle/releases).
+Each release includes an unsigned x64 standalone exe, a ZIP with the license and
+build information, an NSIS installer, SHA-256 sums, the exact source SHA and CI link.
+Microsoft Edge WebView2 is required by the app. GPU/UI runtime remains untested.
+The earlier unisolated `4a6c844` build is superseded and not recommended for trial.
 
----
+Deep Lite does not automatically import or modify upstream Deep settings:
 
-## Features
+| Item | Deep Lite |
+| --- | --- |
+| Settings | `%APPDATA%\DeepLite\settings.json` |
+| Logs | `%APPDATA%\DeepLite\deep-lite.log` |
+| GPU diagnostics | `%TEMP%\deep-lite-gpu-blur.log` |
+| Autostart Run value | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\DeepLite` |
+| Installer identity | `io.github.zufallupon.deeplite`, product `Deep Lite` |
+| Installed executable | `deep-lite.exe` |
 
-- **Focus spotlight** — blurs the entire screen except your focused window.
-- **Two blur modes** — *Deep focus* (uniform full-screen blur) and *Ambient*
-  (progressive: sharp at the top of the screen, ramping to full blur at the bottom).
-- **Tint & grain** — color-tint the blur (10 presets + custom picker) and add a
-  film-grain texture, each with its own intensity.
-- **Mono** — optionally desaturate the blurred area to grayscale.
-- **Shake to toggle** — give your mouse a shake to flip Deep on or off
-  (sensitivity adjustable).
-- **Per-monitor focus** — only blur the monitors you're *not* working on.
-- **App-wide focus** — keep *every* window of the focused app sharp, not just the active one.
-- **Ignored apps** — pin chosen apps to always stay sharp, regardless of focus.
-- **Auto-hide taskbar** and **hide desktop icons** while active (both restored on deactivate).
-- **Smooth crossfades** — tunable fade-in/out duration.
-- **Global hotkeys** for toggling, switching modes, and opening settings.
-- **Start on login** — launch automatically with Windows (per-user, no admin needed).
-- **System tray** integration.
+Autostart defaults **OFF**; a fresh launch does not write or delete any Run value.
+Opting in affects only the `DeepLite` value, never upstream's `Deep` value. The ZIP
+uses this same separate settings directory; it is not a per-folder portable profile.
 
-## Install
+The shared `Local\DeepSingleInstance` mutex intentionally prevents two overlays.
+If Deep or Deep Lite is already running, a second launch exits before settings,
+logging or autostart work. It does not stop the running app. When you choose to
+switch versions, use the existing app's tray Quit command yourself. No user-PC
+app is launched, stopped or overwritten by the build/verification workflow.
 
-1. Go to the [**Releases**](https://github.com/brycelewiswork/deep/releases) page.
-2. Download the latest **`Deep_x.y.z_x64-setup.exe`** (or the `.msi` if you prefer).
-3. Run it and follow the installer.
+## Controls
 
-> **Heads up — unsigned build.** Deep isn't code-signed, so Windows SmartScreen
-> may show *"Windows protected your PC."* Click **More info → Run anyway** to continue.
-> (Building your own from source avoids this — see below.)
-
-Once installed, Deep starts in the system tray. Open settings with the tray icon or
-`Ctrl + Alt + Win + C`, then **Activate** (or shake your mouse, or press
-`Ctrl + Alt + Win + F`).
-
-## Default shortcuts
+Deep Lite starts disabled in the tray. The default hotkeys remain:
 
 | Action | Shortcut |
 | --- | --- |
-| Toggle Deep on/off | `Ctrl + Alt + Win + F` |
-| Switch blur mode | `Ctrl + Alt + Win + M` |
-| Show/hide settings window | `Ctrl + Alt + Win + C` |
+| Toggle focus overlay | `Ctrl + Alt + Win + F` |
+| Switch Deep / Ambient | `Ctrl + Alt + Win + M` |
+| Show/hide settings | `Ctrl + Alt + Win + C` |
 
-All three are rebindable in the settings window.
+Hotkeys and shake sensitivity can be adjusted in settings. “Deep focus” still
+names the uniform blur mode; “Ambient” is the progressive blur mode.
 
-## Customizing it
+## Build and validation
 
-Deep stores its configuration as plain JSON at:
-
-```
-%APPDATA%\Deep\settings.json
-```
-
-Everything in the settings window is written here — blur intensity and mode, tint
-color/opacity, grain, shake sensitivity, fade duration, focus options, ignored apps,
-hotkeys, and start-on-login. You can edit it by hand or just use the UI.
-
-To change behavior beyond what the settings expose, fork the repo and build from source —
-the Rust backend lives in [`src-tauri/src`](src-tauri/src) and the settings UI is plain
-HTML/CSS/JS in [`src/`](src).
-
-## Build from source
-
-**Prerequisites**
-
-- [Node.js](https://nodejs.org) 18+
-- [Rust](https://rustup.rs) (stable)
-- **Microsoft C++ Build Tools** (the "Desktop development with C++" workload) — Tauri
-  needs the MSVC toolchain to compile on Windows. See the
-  [Tauri prerequisites](https://tauri.app/start/prerequisites/) for details.
-
-**Run in development**
+Requires Node.js, Rust stable, Microsoft C++ Build Tools and the Windows SDK.
 
 ```sh
-npm install
+npm ci
 npm run dev
+npm run build -- --ci --bundles nsis -- --locked
 ```
 
-`npm run dev` compiles the Rust backend and launches the app with live-reload of the
-frontend — no separate dev server needed.
+The binary is `src-tauri/target/release/deep-lite.exe`; the installer is under
+`src-tauri/target/release/bundle/nsis/`. Compilation does not launch the app.
 
-**Build an installer**
+The manual [Windows workflow](.github/workflows/verify-windows.yml) checks the
+Windows code, requires at least 10 blur-policy and 6 isolation tests, runs the
+library tests, builds/packages the exe and installer, and records source SHA,
+Authenticode status and hashes. It uses a standard GitHub-hosted Windows runner
+in this public repository. Releases link the successful run for their exact SHA.
 
-```sh
-npm run build
-```
-
-The release binary embeds the frontend, and the installers are written to:
-
-```
-src-tauri/target/release/bundle/nsis/   # Deep_x.y.z_x64-setup.exe
-src-tauri/target/release/bundle/msi/    # Deep_x.y.z_x64_en-US.msi
-```
-
-## Releases / CI
-
-Tagged releases are built automatically. Pushing a `v*` tag (e.g. `v0.1.0`) triggers a
-[GitHub Actions workflow](.github/workflows/release.yml) that builds the Windows
-installers on a `windows-latest` runner and publishes them to a GitHub Release.
-
-## Tech
-
-- **Backend:** Rust + Tauri 2 + the [`windows`](https://crates.io/crates/windows) crate
-- **Compositing:** Windows.Graphics.Capture + Direct3D/Direct2D GPU blur, DirectComposition
-- **Frontend:** vanilla HTML / CSS / JS
-- **Target:** Windows 10/11 (x64)
-
-## Contributing
-
-Issues and pull requests are welcome. Fork it, make it yours, and send improvements back
-if you'd like. For larger changes, opening an issue first to discuss is appreciated.
-
-## License
-
-[MIT](LICENSE) © 2026 Bryce Lewis
+The upstream `release.yml` remains in the repository; `v*` tags trigger it.
+Deep Lite experimental prereleases use `deep-lite-preview-*` tags and verified
+artifacts from the manual workflow instead.

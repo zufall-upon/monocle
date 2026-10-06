@@ -34,6 +34,10 @@ jobs:
           $listedTests | Write-Output
           $policyTests = @($listedTests | Select-String '^blur_policy::tests::.+: test$')
           if ($policyTests.Count -lt 10) { throw "Expected at least 10 blur policy tests; refusing an empty or incomplete suite." }
+          $allTests = cargo test --locked --lib -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $isolationTests = @($allTests | Select-String '^(identity::tests|settings::tests|windows_api::tests|isolation_tests)::.+: test$')
+          if ($isolationTests.Count -lt 6) { throw "Expected at least 6 isolation tests." }
           cargo test --locked --lib
       - name: Build Windows executable and NSIS installer
         run: npm run build -- --ci --bundles nsis -- --locked
@@ -43,7 +47,7 @@ jobs:
       - name: Upload verified build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: monocle-windows-x64-${{ github.sha }}
+          name: deep-lite-windows-x64-${{ github.sha }}
           path: |
             dist/*.exe
             dist/*.zip

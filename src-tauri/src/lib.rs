@@ -1,6 +1,7 @@
 #[cfg(any(windows, test))]
 mod blur_policy;
 mod gpu_blur;
+mod identity;
 mod logging;
 mod magnifier;
 mod overlay;
@@ -249,17 +250,17 @@ fn get_foreground_app() -> Option<settings::IgnoredApp> {
 /// machine can each run their own instance.
 #[cfg(windows)]
 fn acquire_single_instance_lock() -> bool {
-    use windows::core::w;
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
 
+    let name: Vec<u16> = identity::SHARED_MUTEX_NAME.encode_utf16().chain(Some(0)).collect();
     unsafe {
-        match CreateMutexW(None, true, w!("Local\\DeepSingleInstance")) {
+        match CreateMutexW(None, true, PCWSTR(name.as_ptr())) {
             Ok(_handle) => GetLastError() != ERROR_ALREADY_EXISTS,
-            // If the kernel can't even create a mutex, fall through and
-            // allow the launch — failing closed here would lock the user
-            // out for a transient OS hiccup.
-            Err(_) => true,
+            // Do not risk two overlays when exclusivity cannot be established.
+            // This returns before reading settings or touching the Run key.
+            Err(_) => false,
         }
     }
 }
@@ -293,6 +294,7 @@ fn set_start_on_login(enabled: bool) {
         .chain(std::iter::once(0))
         .collect();
 
+    let run_name: Vec<u16> = identity::RUN_VALUE_NAME.encode_utf16().chain(Some(0)).collect();
     unsafe {
         let mut hkey = HKEY::default();
         if RegCreateKeyExW(
@@ -315,10 +317,10 @@ fn set_start_on_login(enabled: bool) {
                 value.as_ptr() as *const u8,
                 value.len() * std::mem::size_of::<u16>(),
             );
-            let _ = RegSetValueExW(hkey, w!("Deep"), None, REG_SZ, Some(bytes));
+            let _ = RegSetValueExW(hkey, PCWSTR(run_name.as_ptr()), None, REG_SZ, Some(bytes));
         } else {
             // Deleting a missing value returns an error we intentionally ignore.
-            let _ = RegDeleteValueW(hkey, w!("Deep"));
+            let _ = RegDeleteValueW(hkey, PCWSTR(run_name.as_ptr()));
         }
         let _ = RegCloseKey(hkey);
     }
@@ -334,9 +336,11 @@ pub fn run() {
 
     logging::init();
     let settings = AppSettings::load();
-    // Reconcile the login entry with the persisted setting on every launch, so
-    // it self-heals if the exe moved or the registry value was edited.
-    set_start_on_login(settings.start_on_login);
+    // Only a previously opted-in Deep Lite setting may reconcile its own Run
+    // value. Fresh/default launches do not create, delete or modify Run values.
+    if identity::reconcile_autostart_on_launch(settings.start_on_login) {
+        set_start_on_login(true);
+    }
     let state = AppState {
         settings: Arc::new(Mutex::new(settings)),
         active: Arc::new(Mutex::new(false)),
@@ -348,16 +352,16 @@ pub fn run() {
         .manage(state.clone())
         .setup(move |app| {
             // Build system tray
-            let toggle_i = MenuItem::with_id(app, "toggle", "Toggle Deep", true, None::<&str>)?;
+            let toggle_i = MenuItem::with_id(app, "toggle", "Toggle Deep Lite", true, None::<&str>)?;
             let settings_i =
                 MenuItem::with_id(app, "settings", "Settings...", true, None::<&str>)?;
             let logs_i =
                 MenuItem::with_id(app, "open_logs", "Open logs", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit Deep", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit Deep Lite", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&toggle_i, &settings_i, &logs_i, &quit_i])?;
 
             let mut tray = TrayIconBuilder::new()
-                .tooltip("Deep")
+                .tooltip(identity::PRODUCT_NAME)
                 .menu(&menu);
             // Show the app icon in the tray. Falls back gracefully if no
             // default window icon is configured.
@@ -472,5 +476,15 @@ pub fn run() {
             get_foreground_app,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Deep");
+        .expect("error while running Deep Lite");
+}
+
+#[cfg(all(test, windows))]
+mod isolation_tests {
+    #[test]
+    fn shared_overlay_mutex_rejects_a_second_instance() {
+        // Runs in the CI test process only, before any app/UI startup.
+        assert!(super::acquire_single_instance_lock());
+        assert!(!super::acquire_single_instance_lock());
+    }
 }

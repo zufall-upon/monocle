@@ -2,11 +2,17 @@
 name = "deep"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+default-run = "deep-lite"
 description = "A lightweight Windows focus overlay that blurs everything except what you're working on."
 authors = ["Bryce Lewis"]
 license = "MIT"
 repository = "https://github.com/brycelewiswork/deep"
 homepage = "https://github.com/brycelewiswork/deep"
+
+[[bin]]
+name = "deep-lite"
+path = "src/main.rs"
 
 [lib]
 name = "deep_lib"
