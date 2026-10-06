@@ -35,12 +35,12 @@ Deep Lite does not automatically import or modify upstream Deep settings:
 | Settings | `%APPDATA%\DeepLite\settings.json` |
 | Logs | `%APPDATA%\DeepLite\deep-lite.log` |
 | GPU diagnostics | `%TEMP%\deep-lite-gpu-blur.log` |
-| Autostart Run value | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\DeepLite` |
+| Autostart Run value | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Deep Lite` |
 | Installer identity | `io.github.zufallupon.deeplite`, product `Deep Lite` |
 | Installed executable | `deep-lite.exe` |
 
 Autostart defaults **OFF**; a fresh launch does not write or delete any Run value.
-Opting in affects only the `DeepLite` value, never upstream's `Deep` value. The ZIP
+Opting in affects only the `Deep Lite` value, never upstream's `Deep` value. The ZIP
 uses this same separate settings directory; it is not a per-folder portable profile.
 
 The shared `Local\DeepSingleInstance` mutex intentionally prevents two overlays.
@@ -84,3 +84,7 @@ in this public repository. Releases link the successful run for their exact SHA.
 The upstream `release.yml` remains in the repository; `v*` tags trigger it.
 Deep Lite experimental prereleases use `deep-lite-preview-*` tags and verified
 artifacts from the manual workflow instead.
+
+The installer’s optional app-data deletion uses the Tauri bundle-ID directories.
+It does not remove `%APPDATA%\DeepLite`; these settings and logs remain after
+uninstall and can be removed manually if no longer needed.

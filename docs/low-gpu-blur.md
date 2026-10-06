@@ -107,12 +107,12 @@ running the library tests. Passing them does not verify WGC/Direct2D execution,
 
 ## Isolation from upstream Deep
 
-Deep Lite uses `%APPDATA%\DeepLite`, a `DeepLite` Run value, product `Deep Lite`,
+Deep Lite uses `%APPDATA%\DeepLite`, a `Deep Lite` Run value, product `Deep Lite`,
 identifier `io.github.zufallupon.deeplite`, and installed binary `deep-lite.exe`.
 Its GPU diagnostic log is `%TEMP%\deep-lite-gpu-blur.log`. Upstream settings are
 not imported, including when the fork's settings are absent or invalid. Fresh
 settings keep autostart OFF and startup performs no Run-key reconciliation in
-that state. Later explicit changes or an existing opt-in affect only DeepLite.
+that state. Later explicit changes or an existing opt-in affect only the Deep Lite Run value.
 
 The upstream mutex is deliberately retained to block simultaneous overlays
 before settings/log/autostart work. Failure to create that mutex also prevents
@@ -158,3 +158,5 @@ Ambient and mode transitions. Record offscreen pass costs and the additional GPU
 memory as well as end-to-end results. Useful references: [WGC frame sizing and
 lifetime](https://learn.microsoft.com/en-us/windows/apps/develop/media-authoring-processing/screen-capture)
 and [Direct2D Gaussian optimization](https://learn.microsoft.com/en-us/windows/win32/direct2d/gaussian-blur).
+
+Final generated-installer review found NSIS removes the product-name Run value on uninstall. The application now uses `Deep Lite` for that value as well, with a regression assertion tying it to `productName`. The initial `8f08d0a` isolated CI passed all 16 tests, but is superseded by this packaging consistency correction.

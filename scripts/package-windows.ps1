@@ -45,13 +45,15 @@ The standalone exe requires the Microsoft Edge WebView2 runtime.
 Deep Lite is separated from upstream Deep:
 - settings/normal logs: %APPDATA%\DeepLite (no automatic import from %APPDATA%\Deep)
 - GPU diagnostics: %TEMP%\deep-lite-gpu-blur.log
-- autostart: HKCU\Software\Microsoft\Windows\CurrentVersion\Run\DeepLite
+- autostart: HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Deep Lite
 - installer/product: Deep Lite; identifier: io.github.zufallupon.deeplite
 - installed executable: deep-lite.exe (distinct from upstream deep.exe)
 Autostart defaults OFF. A default launch does not modify any Run value.
 The upstream Run value named Deep is never written or deleted by this fork.
 The standalone ZIP uses the same separate DeepLite settings as this installer;
 it is not a fully portable per-folder settings profile.
+Uninstall (including its app-data checkbox) retains %APPDATA%\DeepLite;
+remove that fork-only settings/log folder manually if no longer needed.
 
 The shared Local\DeepSingleInstance mutex intentionally prevents simultaneous
 Deep / Deep Lite overlays. If either is already running, this app exits before

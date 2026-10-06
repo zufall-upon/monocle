@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 pub const PRODUCT_NAME: &str = "Deep Lite";
 pub const DATA_DIR_NAME: &str = "DeepLite";
-pub const RUN_VALUE_NAME: &str = "DeepLite";
+// Match the NSIS product name so uninstall removes only our opted-in Run value.
+pub const RUN_VALUE_NAME: &str = PRODUCT_NAME;
 // Intentionally shared with upstream: either application blocks a second
 // overlay before settings, logging or autostart reconciliation can run.
 pub const SHARED_MUTEX_NAME: &str = r"Local\DeepSingleInstance";
@@ -34,6 +35,7 @@ mod tests {
         assert_ne!(config["identifier"], "work.brycelewis.deep");
         assert_eq!(config["app"]["windows"][0]["title"], PRODUCT_NAME);
         assert_ne!(RUN_VALUE_NAME, "Deep");
+        assert_eq!(RUN_VALUE_NAME, config["productName"].as_str().unwrap());
         assert_ne!(DATA_DIR_NAME, "Deep");
     }
 
