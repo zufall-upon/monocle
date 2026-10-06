@@ -55,7 +55,7 @@ mutation; global foreground replacement; previous minimize/restore, monitor tran
 mode/fade/capture policies; settings migration/roundtrip. The native Windows fixture
 creates its own normal window plus visual windows using the production style
 functions and verifies WindowFromPoint still returns the underlying fixture across
-show/hide and recreation, and binds/commits a DirectComposition target for the GPU-window style. The first WS_DISABLED candidate failed this fixture (38 pass / 1 fail) and was not released; production now uses the documented layered-window passthrough instead. It does not send real mouse input, render WGC frames,
+show/hide and recreation, and presents an opaque WARP-rendered swapchain to a DirectComposition target with the GPU-window style, then waits for commit completion. The first WS_DISABLED candidate failed this fixture (38 pass / 1 fail) and was not released; production now uses the documented layered-window passthrough instead. It does not send real mouse input, render WGC frames,
 exercise Explorer's listview, or execute Firefox/Tablacus.
 
 Pending on a real Windows desktop (not performed on the user's PC):

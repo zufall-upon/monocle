@@ -9,7 +9,7 @@ pub fn visual_ex_style(layered: bool) -> WINDOW_EX_STYLE {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::{core::w, Win32::{Foundation::*,Graphics::{DirectComposition::*,Dxgi::IDXGIDevice},System::{LibraryLoader::GetModuleHandleW,WinRT::{RoInitialize,RO_INIT_MULTITHREADED}}}};
+    use windows::{core::{w,Interface}, Win32::{Foundation::*,Graphics::{DirectComposition::*,Direct3D::D3D_DRIVER_TYPE_WARP,Direct3D11::*,Dxgi::{*,Common::*}},System::{LibraryLoader::GetModuleHandleW,WinRT::{RoInitialize,RO_INIT_MULTITHREADED}}}};
     struct Owned(HWND);
     impl Drop for Owned { fn drop(&mut self) { unsafe { let _=DestroyWindow(self.0); } } }
     unsafe extern "system" fn proc(hwnd:HWND,msg:u32,w:WPARAM,l:LPARAM)->LRESULT {
@@ -33,12 +33,29 @@ mod tests {
                 let visual=Owned(CreateWindowExW(visual_ex_style(layered),cls,w!("visual fixture"),visual_style(),100,100,100,100,None,None,Some(instance.into()),None).unwrap());
                 SetLayeredWindowAttributes(visual.0,COLORREF(0),255,LWA_ALPHA).unwrap();
                 let _composition = if !layered {
-                    let device:IDCompositionDevice=DCompositionCreateDevice(None::<&IDXGIDevice>).unwrap();
+                    // A real opaque presented surface, not an empty visual tree.
+                    let mut d3d=None;
+                    let mut context=None;
+                    D3D11CreateDevice(None,D3D_DRIVER_TYPE_WARP,HMODULE::default(),D3D11_CREATE_DEVICE_BGRA_SUPPORT,None,D3D11_SDK_VERSION,Some(&mut d3d),None,Some(&mut context)).unwrap();
+                    let d3d=d3d.unwrap();
+                    let context=context.unwrap();
+                    let dxgi:IDXGIDevice=d3d.cast().unwrap();
+                    let factory:IDXGIFactory2=CreateDXGIFactory2(Default::default()).unwrap();
+                    let desc=DXGI_SWAP_CHAIN_DESC1 { Width:100,Height:100,Format:DXGI_FORMAT_B8G8R8A8_UNORM,SampleDesc:DXGI_SAMPLE_DESC{Count:1,Quality:0},BufferUsage:DXGI_USAGE_RENDER_TARGET_OUTPUT,BufferCount:2,SwapEffect:DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,AlphaMode:DXGI_ALPHA_MODE_PREMULTIPLIED,..Default::default() };
+                    let swapchain=factory.CreateSwapChainForComposition(&d3d,&desc,None).unwrap();
+                    let buffer:ID3D11Texture2D=swapchain.GetBuffer(0).unwrap();
+                    let mut rtv=None;
+                    d3d.CreateRenderTargetView(&buffer,None,Some(&mut rtv)).unwrap();
+                    context.ClearRenderTargetView(&rtv.unwrap(),&[1.0,0.0,0.0,1.0]);
+                    swapchain.Present(0,DXGI_PRESENT(0)).ok().unwrap();
+                    let device:IDCompositionDevice=DCompositionCreateDevice(&dxgi).unwrap();
                     let target=device.CreateTargetForHwnd(visual.0,true).unwrap();
                     let root=device.CreateVisual().unwrap();
+                    root.SetContent(&swapchain).unwrap();
                     target.SetRoot(&root).unwrap();
                     device.Commit().unwrap();
-                    Some((device,target,root))
+                    device.WaitForCommitCompletion().unwrap();
+                    Some((device,target,root,swapchain,d3d))
                 } else { None };
                 let _=ShowWindow(visual.0,SW_SHOWNOACTIVATE);
                 SetWindowPos(visual.0,Some(HWND_TOP),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE).unwrap();
