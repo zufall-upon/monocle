@@ -16,16 +16,16 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-const BLUR_LAYERS: usize = 10;
+const BLUR_LAYERS: usize = 1;
 // Ownership chain (bottom to top):
-// [0..9]=blur layers, [10]=tint, [11]=grain
+// [0]=transparent anchor, [1]=tint/input, [2]=grain
 // Each window owns the next, so owned windows are always above owner.
 // Pushing behind [0] = behind the entire group.
 // (Desaturation is handled separately by the Magnification API in the
 // `magnifier` module — see there.)
 const TOTAL_WINDOWS: usize = BLUR_LAYERS + 2;
-const TINT_IDX: usize = BLUR_LAYERS;     // 10
-const GRAIN_IDX: usize = BLUR_LAYERS + 1; // 11
+const TINT_IDX: usize = BLUR_LAYERS;
+const GRAIN_IDX: usize = BLUR_LAYERS + 1;
 // Grain is a sparse, signed (bipolar) speckle pushed onto the grain window
 // with per-pixel premultiplied alpha (UpdateLayeredWindow). Most pixels are
 // fully transparent. This caps the layer alpha at slider = 100%: 0.27 was
@@ -1089,13 +1089,13 @@ fn find_top_window_on_monitor(target_mon: isize, all_hwnds: &[isize]) -> Option<
 
 const BLUR_LAYER_GRADIENT: u32 = 0x01FFFFFF;
 
-/// Layout: [0..9]=blur, [10]=tint, [11]=grain (ownership chain, bottom to top)
+/// Layout: anchor, tint/input, grain (ownership chain, bottom to top)
 #[cfg(windows)]
 unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
     let tint_hwnd = HWND(all_hwnds[TINT_IDX] as *mut _);
     let grain_hwnd = HWND(all_hwnds[GRAIN_IDX] as *mut _);
 
-    // --- Tint window [10] ---
+    // --- Tint/input window ---
     // The tint color is now an HSL "Color" blend folded into the GPU blur
     // pipeline (see gpu_blur::set_tint), so this window contributes nothing
     // visually. But it still doubles as the input catcher (no
@@ -1109,7 +1109,7 @@ unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
     ).ok();
     set_accent(tint_hwnd, ACCENT_DISABLED, 0);
 
-    // --- Grain window [11] ---
+    // --- Grain window ---
     // Per-pixel premultiplied alpha via UpdateLayeredWindow: sparse signed
     // colored specks. The slider scales the whole layer through
     // SourceConstantAlpha. Grain is click-through (WS_EX_TRANSPARENT) and never
@@ -1118,7 +1118,7 @@ unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
         .clamp(0.0, 255.0) as u8;
     update_grain_layer(grain_hwnd, grain_strength);
 
-    // --- Blur layers [0..9] ---
+    // --- Transparent z-order anchor ---
     // The old acrylic-blur path (SetWindowCompositionAttribute +
     // ACCENT_ENABLE_ACRYLICBLURBEHIND with a white gradient offset) is
     // retired: the GPU capture blur (gpu_blur module) now does the blur.

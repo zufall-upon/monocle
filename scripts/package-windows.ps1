@@ -35,6 +35,10 @@ CI: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
 
 Compiled and packaged with the Tauri CLI on a standard GitHub-hosted Windows runner.
 Rust policy tests passed in this run; GPU/UI runtime was NOT exercised.
+Renderer revision 2: direct ingestion, effect caches, three-level Ambient,
+output-adapter selection. This is NOT evidence of measured GPU savings.
+Operation counters: %TEMP%\deep-lite-gpu-blur.log (10-second cumulative samples).
+Fully occluded monitors are not automatically suspended.
 No code-signing certificate was supplied. Authenticode status:
 $($signatures -join "`n")
 

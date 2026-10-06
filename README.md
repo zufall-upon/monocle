@@ -8,14 +8,21 @@ UI on Windows 10/11 x64. Upstream's MIT license is retained in [LICENSE](LICENSE
 quality.** Three-monitor behavior, visual quality and GPU/power measurements still
 need validation. See [implementation and validation notes](docs/low-gpu-blur.md).
 
-## What changed
+## Renderer revision 2
 
-- Budget background blur updates to 20 per second; reuse unchanged frames.
-- Close capture after deactivation fades out; reopen on activation.
-- Strong Deep blur uses half-width/half-height effect bitmaps. Weak blur and odd
-  monitor dimensions use the original full-resolution path.
-- Ambient keeps its sharp base and eight native-resolution blur bands.
-- Rebuild monitor resources on display changes and resume.
+The first preview was reported too heavy. This revision removes the normal
+full-resolution input copy, caches completed blur images across fades, and uses
+three reduced-resolution Ambient levels instead of eight native Gaussian levels.
+Strong blur uses quarter-width/height processing on divisible dimensions; weak
+and odd-size cases preserve the native path. Ambient keeps a native sharp base.
+Display devices select their owning GPU, and monitor-specific operation counters
+are written to `%TEMP%\deep-lite-gpu-blur.log` every 10 seconds.
+
+The 20 Hz budget remains. WGC and final composition remain full resolution.
+These are code-path reductions, **not a measured GPU-performance result**.
+Ambient/tint appearance changes need visual checking. Fully hidden monitors are
+not automatically suspended because opacity cannot safely be inferred from bounds.
+See [counter interpretation, comparison procedure and limitations](docs/low-gpu-blur.md).
 
 Deep's existing per-monitor/app-wide focus, ignored apps, desaturation, tint,
 grain, shake toggle, fades and configurable hotkeys remain available.
@@ -76,7 +83,7 @@ The binary is `src-tauri/target/release/deep-lite.exe`; the installer is under
 `src-tauri/target/release/bundle/nsis/`. Compilation does not launch the app.
 
 The manual [Windows workflow](.github/workflows/verify-windows.yml) checks the
-Windows code, requires at least 10 blur-policy and 6 isolation tests, runs the
+Windows code, requires at least 13 blur-policy and 6 isolation tests, runs the
 library tests, builds/packages the exe and installer, and records source SHA,
 Authenticode status and hashes. It uses a standard GitHub-hosted Windows runner
 in this public repository. Releases link the successful run for their exact SHA.

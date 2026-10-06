@@ -69,12 +69,8 @@ pub fn reassert_z(insert_after: isize) {
     imp::reassert_z(insert_after);
 }
 
-/// Focused-window rectangles (virtual-screen coords, `(left, top, right,
-/// bottom)`) whose footprint must be "neutralized" in the captured frame
-/// before blurring. Painting each window's region with its surrounding
-/// background pixels removes the crisp window content from the blur input,
-/// so it can't smear outward into a halo around the raised foreground app.
-/// Called every tracker tick with the current focused group(s).
+/// Tracker geometry notification. This is not an effect input and must not
+/// invalidate pixels.
 #[cfg(windows)]
 pub fn set_focus_rects(rects: &[(i32, i32, i32, i32)]) {
     imp::set_focus_rects(rects);
@@ -99,14 +95,14 @@ pub fn set_focus_rects(_rects: &[(i32, i32, i32, i32)]) {}
 
 #[cfg(windows)]
 mod imp {
-    use crate::blur_policy::{half_deep_plan, CaptureDemand, Extent, HalfDeepPlan, SessionAction, UpdateState};
+    use crate::blur_policy::{processing_plan, required_bands, CaptureDemand, EffectKey, EffectValidity, Extent, SessionAction, UpdateState};
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use windows::core::{factory, w, Interface};
     use windows::Graphics::Capture::{
-        Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+        Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem, GraphicsCaptureSession,
     };
     use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
     use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -130,9 +126,9 @@ mod imp {
         D2D1_PROPERTY_TYPE_ENUM, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_VECTOR4,
         D2D1_SATURATION_PROP_SATURATION,
     };
-    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+        D3D11CreateDevice, ID3D11Device, ID3D11Texture2D,
         D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
@@ -143,7 +139,7 @@ mod imp {
         DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
     };
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
+        CreateDXGIFactory2, IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
         DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
     };
     use windows::Win32::Graphics::Gdi::{
@@ -167,7 +163,7 @@ mod imp {
     // Ambient (progressive) blur stacks this many discrete blur bands, each
     // masked by its own vertical gradient, to approximate a continuous
     // top-to-bottom blur ramp.
-    const PROGRESSIVE_BANDS: u32 = 8;
+    const PROGRESSIVE_BANDS: u32 = 3;
 
     // --- Global state shared with the overlay (one set for all monitors) ---
     static STDDEV_BITS: AtomicU32 = AtomicU32::new(0);
@@ -188,8 +184,7 @@ mod imp {
     static ACTIVE: AtomicBool = AtomicBool::new(false);
     // Every live blur window, so sync()/reassert_z() can address them all.
     static WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
-    // Focused-window rects (virtual-screen coords) to neutralize before the
-    // blur. Updated each tracker tick; draw() reads them per monitor.
+    // Exact opaque-client candidates are separate from animated focus bounds.
     static FOCUS_RECTS: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
 
     fn stddev() -> f32 {
@@ -213,9 +208,9 @@ mod imp {
     }
 
     pub fn set_params(stddev: f32, desaturate: bool) {
-        STDDEV_BITS.store(stddev.to_bits(), Ordering::Relaxed);
-        DESATURATE.store(desaturate, Ordering::Relaxed);
-        sync();
+        let old_sigma = STDDEV_BITS.swap(stddev.to_bits(), Ordering::Relaxed);
+        let old_mono = DESATURATE.swap(desaturate, Ordering::Relaxed);
+        if old_sigma != stddev.to_bits() || old_mono != desaturate { sync(); }
     }
 
     pub fn set_mode_mix(mix: f64) {
@@ -237,8 +232,7 @@ mod imp {
     }
 
     pub fn set_active(active: bool) {
-        ACTIVE.store(active, Ordering::Relaxed);
-        sync();
+        if ACTIVE.swap(active, Ordering::Relaxed) != active { sync(); }
     }
 
     pub fn set_focus_rects(rects: &[(i32, i32, i32, i32)]) {
@@ -248,7 +242,7 @@ mod imp {
         }
         *cur = rects.to_vec();
         drop(cur);
-        sync();
+        // Rectangles currently do not alter pixels. Do not invalidate every GPU.
     }
 
     fn sync() {
@@ -348,16 +342,17 @@ mod imp {
         // handoff between adjacent blur levels across its own screen slice.
         grad_bands: Vec<ID2D1LinearGradientBrush>,
         framepool: Direct3D11CaptureFramePool,
-        d3d_ctx: ID3D11DeviceContext,
-        cap_tex: ID3D11Texture2D,
-        cap_bmp: ID2D1Bitmap1,
+        frame: RefCell<Option<Direct3D11CaptureFrame>>,
+        frame_id: Cell<u64>,
+        effects: RefCell<Option<EffectSurfaces>>,
+        perf: RefCell<Perf>,
+        fallback_texture: RefCell<Option<ID3D11Texture2D>>,
         // This monitor's top-left in virtual-screen coords, to map the
         // focus rects (which arrive in virtual coords) into local pixels.
         origin_x: i32,
         origin_y: i32,
         updates: RefCell<UpdateState>,
-        half_deep: RefCell<Option<HalfDeepSurfaces>>,
-        half_deep_unavailable: Cell<bool>,
+
         item: GraphicsCaptureItem,
         session: RefCell<Option<GraphicsCaptureSession>>,
         _d3d: ID3D11Device,
@@ -374,6 +369,7 @@ mod imp {
             if let Some(session) = self.session.get_mut().take() {
                 let _ = session.Close();
             }
+            if let Some(frame) = self.frame.get_mut().take() { let _ = frame.Close(); }
             let _ = self.framepool.Close();
         }
     }
@@ -467,11 +463,26 @@ mod imp {
         width: u32,
         height: u32,
     ) -> windows::core::Result<()> {
+        // Prefer the adapter physically owning this monitor; never alter OS settings.
+        let factory: IDXGIFactory2 = CreateDXGIFactory2(Default::default())?;
+        let mut selected: Option<IDXGIAdapter> = None;
+        let mut index = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(index) {
+            let mut output_index = 0;
+            while let Ok(output) = adapter.EnumOutputs(output_index) {
+                if output.GetDesc()?.Monitor.0 as isize == hmon {
+                    selected = Some(adapter.cast()?); break;
+                }
+                output_index += 1;
+            }
+            if selected.is_some() { break; }
+            index += 1;
+        }
         // --- D3D11 device (BGRA for D2D interop) ---
         let mut d3d: Option<ID3D11Device> = None;
         D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
+            selected.as_ref(),
+            if selected.is_some() { D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_HARDWARE },
             HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             None,
@@ -482,6 +493,9 @@ mod imp {
         )?;
         let d3d = d3d.unwrap();
         let dxgi_device: IDXGIDevice = d3d.cast()?;
+        let actual = dxgi_device.GetAdapter()?.GetDesc()?;
+        let name = String::from_utf16_lossy(&actual.Description);
+        log(&format!("adapter monitor={hmon:#x} origin={origin_x},{origin_y} size={width}x{height} selected_by_output={} name={} luid={}:{}", selected.is_some(), name.trim_end_matches('\0'), actual.AdapterLuid.HighPart, actual.AdapterLuid.LowPart));
 
         // --- Direct2D device + context, pinned to 96 dpi (physical px) ---
         let d2d_factory: ID2D1Factory1 =
@@ -615,41 +629,6 @@ mod imp {
             2,
             size,
         )?;
-        // Owned texture we CopyResource each frame into (frame-pool textures
-        // recycle after Close()), wrapped as a D2D bitmap for the chain.
-        let cap_desc = D3D11_TEXTURE2D_DESC {
-            Width: size.Width as u32,
-            Height: size.Height as u32,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let mut cap_tex: Option<ID3D11Texture2D> = None;
-        d3d.CreateTexture2D(&cap_desc, None, Some(&mut cap_tex))?;
-        let cap_tex = cap_tex.unwrap();
-        let cap_surf: IDXGISurface = cap_tex.cast()?;
-        let cap_props = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_IGNORE,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
-            colorContext: std::mem::ManuallyDrop::new(None),
-        };
-        let cap_bmp: ID2D1Bitmap1 = ctx.CreateBitmapFromDxgiSurface(&cap_surf, Some(&cap_props))?;
-
-        let d3d_ctx = d3d.GetImmediateContext()?;
-
         RENDER.with(|r| {
             *r.borrow_mut() = Some(Render {
                 ctx,
@@ -662,14 +641,15 @@ mod imp {
                 crossfade,
                 grad_bands,
                 framepool,
-                d3d_ctx,
-                cap_tex,
-                cap_bmp,
+                frame: RefCell::new(None),
+                frame_id: Cell::new(0),
+                effects: RefCell::new(None),
+                perf: RefCell::new(Perf::new()),
+                fallback_texture: RefCell::new(None),
                 origin_x,
                 origin_y,
                 updates: RefCell::new(UpdateState::new(Extent { width, height })),
-                half_deep: RefCell::new(None),
-                half_deep_unavailable: Cell::new(false),
+
                 item,
                 session: RefCell::new(None),
                 _d3d: d3d,
@@ -696,287 +676,241 @@ mod imp {
         });
     }
 
+    struct Perf {
+        started: std::time::Instant, last: std::time::Instant,
+        acquired: u64, skipped: u64, downsample: u64, sharp: u64,
+        blur: u64, present: u64, starts: u64, stops: u64, copies: u64, native_ingest: u64,
+    }
+    impl Perf {
+        fn new() -> Self { Self { started: std::time::Instant::now(), last: std::time::Instant::now(), acquired: 0, skipped: 0, downsample: 0, sharp: 0, blur: 0, present: 0, starts: 0, stops: 0, copies: 0, native_ingest: 0 } }
+    }
+    struct EffectSurfaces {
+        extent: Extent, input: ID2D1Bitmap1, input_frame: Option<u64>,
+        bands: [Option<ID2D1Bitmap1>; 3], sharp: Option<ID2D1Bitmap1>, raw_sharp: Option<ID2D1Bitmap1>, raw_frame: Option<u64>, validity: EffectValidity,
+    }
+
     unsafe fn draw(hwnd: HWND, rs: &Render) -> windows::core::Result<()> {
-        let ctx = &rs.ctx;
+        {
+            let mut p = rs.perf.borrow_mut();
+            if p.last.elapsed().as_secs() >= 10 {
+                log(&format!("perf monitor={},{} elapsed_ms={} capture={} skipped={} copy_resource={} downsample={} native_ingest={} sharp={} blur={} present={} starts={} stops={} session={}", rs.origin_x, rs.origin_y, p.started.elapsed().as_millis(), p.acquired, p.skipped, p.copies, p.downsample, p.native_ingest, p.sharp, p.blur, p.present, p.starts, p.stops, rs.session.borrow().is_some()));
+                p.last = std::time::Instant::now();
+            }
+        }
         let revision = REVISION.load(Ordering::Acquire);
-        let wanted = wants_capture();
+        let wanted = wants_capture() && fade() > 0.0;
         let action = rs.updates.borrow_mut().set_capture(wanted);
         if !wanted {
             sync_visibility(hwnd, rs);
             if let Some(session) = rs.session.borrow_mut().take() {
                 session.Close()?;
-                for _ in 0..2 {
-                    if let Ok(frame) = rs.framepool.TryGetNextFrame() {
-                        let _ = frame.Close();
-                    } else { break; }
-                }
+                rs.perf.borrow_mut().stops += 1;
+                if let Some(frame) = rs.frame.borrow_mut().take() { let _ = frame.Close(); }
+                *rs.effects.borrow_mut() = None;
+                for _ in 0..2 { if let Ok(frame) = rs.framepool.TryGetNextFrame() { let _ = frame.Close(); } else { break; } }
             }
             return Ok(());
         }
-
         if action == SessionAction::Start {
             let session = rs.framepool.CreateCaptureSession(&rs.item)?;
             let _ = session.SetIsCursorCaptureEnabled(false);
             let _ = session.SetIsBorderRequired(false);
-            // Optional on newer Windows. Older systems return E_NOINTERFACE;
-            // our consumer-side budget still applies there.
-            let _ = session.SetMinUpdateInterval(windows::Foundation::TimeSpan {
-                Duration: i64::from(FRAME_INTERVAL_MS) * 10_000,
-            });
+            // Require whole rendered frames when supported; never infer image
+            // equality from non-cumulative dirty metadata on a dropping pool.
+            let dirty = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly).is_ok();
+            let interval = session.SetMinUpdateInterval(windows::Foundation::TimeSpan { Duration: i64::from(FRAME_INTERVAL_MS) * 10_000 }).is_ok();
+            log(&format!("capture monitor={},{} dirty_regions={} min_interval={}", rs.origin_x, rs.origin_y, dirty, interval));
             session.StartCapture()?;
+            rs.perf.borrow_mut().starts += 1;
             *rs.session.borrow_mut() = Some(session);
         }
+        // Frames live only through this tick's source ingestion. EndDraw before
+        // Close; no borrowed WGC surface survives in an effect or cached image.
+        let mut newest: Option<Direct3D11CaptureFrame> = None;
 
-        // Retain only the freshest queued frame, closing older frames before
-        // touching the GPU. Bound the drain to the pool size so a producer
-        // cannot starve the UI thread by supplying frames continuously.
-        let mut newest = None;
         for _ in 0..2 {
             match rs.framepool.TryGetNextFrame() {
                 Ok(frame) => {
-                    if let Some(old) = newest.replace(frame) {
-                        let _ = old.Close();
-                    }
+                    rs.perf.borrow_mut().acquired += 1;
+                    if let Some(old) = newest.replace(frame) { let _ = old.Close(); rs.perf.borrow_mut().skipped += 1; }
                 }
-                // windows-rs maps a successful null frame (empty pool) to
-                // Error::empty(). Other errors must trigger resource recovery.
                 Err(e) if e.code() == windows::core::Error::empty().code() => break,
-                Err(e) => {
-                    if let Some(frame) = newest { let _ = frame.Close(); }
-                    return Err(e);
-                }
+                Err(e) => { if let Some(frame) = newest { let _ = frame.Close(); } return Err(e); }
             }
         }
         if let Some(frame) = newest {
-            // Always release the checked-out frame, including on COM failures.
-            let result = (|| -> windows::core::Result<()> {
-                let size = frame.ContentSize()?;
-                let surface = frame.Surface()?;
-                let access = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
-                let src_tex = access.GetInterface::<ID3D11Texture2D>()?;
-                let mut desc = D3D11_TEXTURE2D_DESC::default();
-                src_tex.GetDesc(&mut desc);
-                let accepted = rs.updates.borrow_mut().accept_frame(
-                    Extent { width: size.Width as u32, height: size.Height as u32 },
-                    Extent { width: desc.Width, height: desc.Height },
-                );
-                if !accepted {
-                    return Err(windows::core::Error::from_hresult(E_INVALIDARG));
-                }
-                rs.d3d_ctx.CopyResource(&rs.cap_tex, &src_tex);
-                Ok(())
-            })();
-            let _ = frame.Close();
-            result?;
+            {
+                let result = (|| -> windows::core::Result<()> {
+                    let size = frame.ContentSize()?;
+                    let access = frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?;
+                    let texture = access.GetInterface::<ID3D11Texture2D>()?;
+                    let mut desc = D3D11_TEXTURE2D_DESC::default(); texture.GetDesc(&mut desc);
+                    if !rs.updates.borrow_mut().accept_frame(Extent { width: size.Width as u32, height: size.Height as u32 }, Extent { width: desc.Width, height: desc.Height }) {
+                        return Err(windows::core::Error::from_hresult(E_INVALIDARG));
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result { let _ = frame.Close(); return Err(e); }
+                if let Some(old) = rs.frame.borrow_mut().replace(frame) { let _ = old.Close(); }
+                rs.frame_id.set(rs.frame_id.get().wrapping_add(1));
+            }
         }
-        // Reuse the existing swapchain image on a static desktop. Settings,
-        // fade and mode changes can redraw the cached capture without waiting
-        // for another WGC frame.
-        if !rs.updates.borrow().needs_draw(revision) {
+        if !rs.updates.borrow().needs_draw(revision) { return Ok(()); }
+        if fade() <= 0.0 { return Ok(()); }
+        let sigma = stddev();
+        let mix = mode_mix();
+        let fade = fade() as f32;
+        let (r,g,b) = tint_rgb();
+        let key = EffectKey { frame: rs.frame_id.get(), sigma: sigma.to_bits(), desaturate: DESATURATE.load(Ordering::Relaxed), tint: [r.to_bits(),g.to_bits(),b.to_bits(),tint_strength().to_bits()] };
+        let plan = processing_plan(Extent { width:rs.width,height:rs.height },sigma);
+        let need_fresh_source = {
+            let cache = rs.effects.borrow();
+            cache.as_ref().map(|c| c.extent != plan.extent ||
+                ((mix > 0.001 || sigma <= 0.0) && c.raw_frame != Some(key.frame))).unwrap_or(true)
+        };
+        if need_fresh_source && rs.frame.borrow().is_none() {
+            // Deep did not keep a native source. Request a fresh frame for a
+            // sharp Ambient base / processing-size change, without holding a
+            // WGC pool buffer indefinitely on a static desktop.
+            if let Some(session) = rs.session.borrow_mut().take() { session.Close()?; rs.perf.borrow_mut().stops += 1; }
+            rs.updates.borrow_mut().set_capture(false);
             return Ok(());
         }
-
-        let fade = fade();
-
+        let prepared = prepare_effects(rs, key, mix);
+        if let Some(frame) = rs.frame.borrow_mut().take() { let _ = frame.Close(); }
+        prepared?;
+        let ctx = &rs.ctx;
         let back: IDXGISurface = rs.swapchain.GetBuffer(0)?;
-        let props = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        let target = ctx.CreateBitmapFromDxgiSurface(&back, Some(&D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0, dpiY: 96.0, bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             colorContext: std::mem::ManuallyDrop::new(None),
-        };
-        let target_bitmap: ID2D1Bitmap1 = ctx.CreateBitmapFromDxgiSurface(&back, Some(&props))?;
-        let w = rs.width as f32;
-        let h = rs.height as f32;
-
-        // Only paint blur while there's something to show. When fully faded
-        // out we present a transparent frame (clears the last image) and let
-        // the sync handler hide the window.
-        if fade > 0.0 {
-            let stddev = stddev();
-            let desaturate = DESATURATE.load(Ordering::Relaxed);
-
-            // Source region = the whole monitor, drawn 1:1 at the origin.
-            let source_rect = D2D_RECT_F {
-                left: 0.0,
-                top: 0.0,
-                right: w,
-                bottom: h,
-            };
-
-            // cap_bmp -> saturation (shared sharp, optionally desaturated source)
-            rs.saturation.SetInput(0, &rs.cap_bmp, true);
-            set_saturation(&rs.saturation, if desaturate { 0.0 } else { 1.0 });
-            let sat_out = rs.saturation.GetOutput()?;
-
-            // Tint: colorize the (de)saturated source before it fans out to the
-            // blur. Applied here (not on the raw capture) so the desaturate
-            // toggle can't strip the tint color back out. At strength ~0 we
-            // skip the blend chain and feed the source straight through.
-            let (tr, tg, tb) = tint_rgb();
-            let strength = tint_strength();
-            let src: ID2D1Image = if strength > 0.001 {
-                set_flood_color(&rs.flood, tr, tg, tb);
-                let flood_out = rs.flood.GetOutput()?;
-                // dest (input 0) = background, source (input 1) = tint color.
-                rs.blend.SetInput(0, &sat_out, true);
-                rs.blend.SetInput(1, &flood_out, true);
-                let blend_out = rs.blend.GetOutput()?;
-                // CrossFade output = input0*weight + input1*(1-weight), so put
-                // the colorized image on input 0 and the untinted one on input
-                // 1. Weight then reads directly as the colorize amount: 0 =
-                // untinted, `strength` = how strongly to tint.
-                rs.crossfade.SetInput(0, &blend_out, true);
-                rs.crossfade.SetInput(1, &sat_out, true);
-                set_crossfade_weight(&rs.crossfade, strength);
-                rs.crossfade.GetOutput()?
-            } else {
-                sat_out.clone()
-            };
-
-            // Deep-focus <-> ambient blend. 0 = uniform (deep focus), 1 =
-            // progressive (ambient). Mid-values render both and crossfade so
-            // the mode switch dissolves smoothly instead of cutting hard.
-            let mix = mode_mix();
-            let show_deep = mix < 0.999;
-            let show_ambient = mix > 0.001;
-            let half_plan = half_deep_plan(Extent { width: rs.width, height: rs.height }, stddev, mix);
-            let half_bitmap = if let Some(plan) = half_plan {
-                render_half_deep(rs, &src, plan)?
-            } else { None };
-
-            ctx.SetTarget(&target_bitmap);
-            ctx.BeginDraw();
-            ctx.Clear(Some(&transparent()));
-
-            // --- Deep focus: uniform full-screen blur (drawn first, beneath
-            // the ambient stack). Opacity = fade. During a transition the
-            // ambient stack dissolves in on top; at the bottom of the screen
-            // both treatments are full blur, so the still-opaque deep layer
-            // never reads as a double image.
-            if show_deep {
-                let faded = fade < 0.999;
-                if faded {
-                    let layer = D2D1_LAYER_PARAMETERS1 {
-                        contentBounds: source_rect,
-                        geometricMask: std::mem::ManuallyDrop::new(None),
-                        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                        maskTransform: identity(),
-                        opacity: fade as f32,
-                        opacityBrush: std::mem::ManuallyDrop::new(None),
-                        layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-                    };
-                    ctx.PushLayer(&layer, None);
-                }
-                if let Some(bitmap) = half_bitmap.as_ref() {
-                    // A materialized small bitmap, not a live Gaussian graph:
-                    // upscaling cannot cause the blur to evaluate at native size.
-                    ctx.DrawBitmap(bitmap, Some(&source_rect), 1.0,
-                        D2D1_INTERPOLATION_MODE_LINEAR, None, None);
-                } else {
-                    rs.gaussian.SetInput(0, &src, true);
-                    set_blur(&rs.gaussian, stddev);
-                    let output = rs.gaussian.GetOutput()?;
-                    ctx.DrawImage(
-                        &output, None, Some(&source_rect),
-                        D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                    );
-                }
-                if faded {
-                    ctx.PopLayer();
-                }
-            }
-
-            // --- Ambient (progressive) blur: stack PROGRESSIVE_BANDS
-            // increasingly-blurred copies back-to-front over the sharp
-            // (desaturated) base. Each band is masked by its own vertical
-            // gradient so it fades in across its screen slice — crisp at the
-            // top, peak blur (stddev) at the bottom. The whole stack is wrapped
-            // in one outer layer at opacity = fade * mix, which folds in both
-            // the activation crossfade and the mode-switch dissolve.
-            if show_ambient {
-                let amb_opacity = (fade * mix) as f32;
-                let layered = amb_opacity < 0.999;
-                if layered {
-                    let layer = D2D1_LAYER_PARAMETERS1 {
-                        contentBounds: source_rect,
-                        geometricMask: std::mem::ManuallyDrop::new(None),
-                        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                        maskTransform: identity(),
-                        opacity: amb_opacity,
-                        opacityBrush: std::mem::ManuallyDrop::new(None),
-                        layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-                    };
-                    ctx.PushLayer(&layer, None);
-                }
-
-                // Sharp base (blur 0).
-                ctx.DrawImage(
-                    &src,
-                    None,
-                    Some(&source_rect),
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                );
-
-                // Stack increasingly-blurred bands, each masked by its gradient.
-                rs.gaussian.SetInput(0, &src, true);
-                let n = rs.grad_bands.len() as f32;
-                for (idx, band) in rs.grad_bands.iter().enumerate() {
-                    let level = stddev * (idx as f32 + 1.0) / n;
-                    set_blur(&rs.gaussian, level);
-                    let output = rs.gaussian.GetOutput()?;
-                    // AddRef the brush into the layer's ManuallyDrop slot, then
-                    // reclaim + drop it after PopLayer to balance the reference.
-                    let brush: ID2D1Brush = band.cast()?;
-                    let layer = D2D1_LAYER_PARAMETERS1 {
-                        contentBounds: source_rect,
-                        geometricMask: std::mem::ManuallyDrop::new(None),
-                        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                        maskTransform: identity(),
-                        opacity: 1.0,
-                        opacityBrush: std::mem::ManuallyDrop::new(Some(brush)),
-                        layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-                    };
-                    ctx.PushLayer(&layer, None);
-                    ctx.DrawImage(
-                        &output,
-                        None,
-                        Some(&source_rect),
-                        D2D1_INTERPOLATION_MODE_LINEAR,
-                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                    );
-                    ctx.PopLayer();
-                    let _ = std::mem::ManuallyDrop::into_inner(layer.opacityBrush);
-                }
-
-                if layered {
-                    ctx.PopLayer();
-                }
-            }
-        } else {
-            ctx.SetTarget(&target_bitmap);
-            ctx.BeginDraw();
-            ctx.Clear(Some(&transparent()));
+        }))?;
+        let bounds = rect(rs.width, rs.height);
+        let cache = rs.effects.borrow(); let cache = cache.as_ref().unwrap();
+        ctx.SetTarget(&target); ctx.BeginDraw(); ctx.Clear(Some(&transparent()));
+        if mix < 0.999 {
+            let bitmap = if sigma > 0.0 { cache.bands[2].as_ref().unwrap() } else { cache.sharp.as_ref().unwrap() };
+            ctx.DrawBitmap(bitmap, Some(&bounds), fade, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
         }
-
+        if mix > 0.001 {
+            let layer = make_layer(bounds, fade * mix as f32, None);
+            ctx.PushLayer(&layer, None);
+            ctx.DrawBitmap(cache.sharp.as_ref().unwrap(), Some(&bounds), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+            if sigma > 0.0 {
+                for (index, gradient) in rs.grad_bands.iter().enumerate() {
+                    let layer = make_layer(bounds, 1.0, Some(gradient.cast()?));
+                    ctx.PushLayer(&layer, None);
+                    ctx.DrawBitmap(cache.bands[index].as_ref().unwrap(), Some(&bounds), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                    ctx.PopLayer(); drop(std::mem::ManuallyDrop::into_inner(layer.opacityBrush));
+                }
+            }
+            ctx.PopLayer();
+        }
         ctx.EndDraw(None, None)?;
         rs.swapchain.Present(0, Default::default()).ok()?;
+        rs.perf.borrow_mut().present += 1;
         rs.updates.borrow_mut().presented(revision);
         sync_visibility(hwnd, rs);
         Ok(())
     }
 
-    struct HalfDeepSurfaces {
-        // Materialize tint at native 96-DPI resolution before scaling. Moving
-        // DISSOLVE itself to the half-size target would double its grain size.
-        tinted_native: ID2D1Bitmap1,
-        input: ID2D1Bitmap1,
-        blurred: ID2D1Bitmap1,
+    fn rect(width: u32, height: u32) -> D2D_RECT_F { D2D_RECT_F { left: 0.0, top: 0.0, right: width as f32, bottom: height as f32 } }
+    fn make_layer(bounds: D2D_RECT_F, opacity: f32, brush: Option<ID2D1Brush>) -> D2D1_LAYER_PARAMETERS1 {
+        D2D1_LAYER_PARAMETERS1 { contentBounds: bounds, geometricMask: std::mem::ManuallyDrop::new(None), maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, maskTransform: identity(), opacity, opacityBrush: std::mem::ManuallyDrop::new(brush), layerOptions: D2D1_LAYER_OPTIONS1_NONE }
+    }
+
+    unsafe fn prepare_effects(rs: &Render, key: EffectKey, mix: f64) -> windows::core::Result<()> {
+        let sigma = f32::from_bits(key.sigma);
+        let plan = processing_plan(Extent { width: rs.width, height: rs.height }, sigma);
+        let mut cache = rs.effects.borrow_mut();
+        if cache.as_ref().map(|c| c.extent != plan.extent).unwrap_or(true) {
+            *cache = Some(EffectSurfaces { extent: plan.extent, input: effect_bitmap(&rs.ctx, plan.extent)?, input_frame: None, bands: [None,None,None], sharp: None, raw_sharp: None, raw_frame: None, validity: EffectValidity::default() });
+        }
+        let c = cache.as_mut().unwrap(); c.validity.update(key);
+        let needed = required_bands(mix, sigma);
+        let needs_input = needed.iter().any(|&v|v) && c.input_frame != Some(key.frame);
+        let needs_sharp = (mix > 0.001 || sigma <= 0.0) && c.validity.needs_sharp();
+        let needs_raw_sharp = needs_sharp && c.raw_frame != Some(key.frame);
+        if needs_input || needs_raw_sharp {
+            let frame = rs.frame.borrow(); let frame = frame.as_ref().unwrap();
+            let access = frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?;
+            let texture = access.GetInterface::<ID3D11Texture2D>()?;
+            let surface: IDXGISurface = texture.cast()?;
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE }, dpiX:96.0,dpiY:96.0,bitmapOptions:D2D1_BITMAP_OPTIONS_NONE,colorContext:std::mem::ManuallyDrop::new(None),
+            };
+            let native = match rs.ctx.CreateBitmapFromDxgiSurface(&surface, Some(&props)) {
+                Ok(bitmap) => bitmap,
+                Err(_) => {
+                    // Compatibility fallback only: do not repeatedly recreate
+                    // the device if a driver cannot sample the WGC surface.
+                    let mut fallback = rs.fallback_texture.borrow_mut();
+                    if fallback.is_none() {
+                        let mut desc = D3D11_TEXTURE2D_DESC::default(); texture.GetDesc(&mut desc);
+                        desc.BindFlags = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+                        desc.Usage = D3D11_USAGE_DEFAULT; desc.CPUAccessFlags = 0; desc.MiscFlags = 0;
+                        rs._d3d.CreateTexture2D(&desc,None,Some(&mut *fallback))?;
+                        log(&format!("capture compatibility-copy fallback monitor={},{}",rs.origin_x,rs.origin_y));
+                    }
+                    rs._d3d.GetImmediateContext()?.CopyResource(fallback.as_ref().unwrap(),&texture);
+                    rs.perf.borrow_mut().copies += 1;
+                    rs.ctx.CreateBitmapFromDxgiSurface(&fallback.as_ref().unwrap().cast::<IDXGISurface>()?,Some(&props))?
+                }
+            };
+            if needs_input {
+                rs.ctx.SetTarget(&c.input); rs.ctx.BeginDraw();
+                rs.ctx.DrawBitmap(&native, Some(&rect(plan.extent.width,plan.extent.height)), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, Some(&rect(rs.width,rs.height)), None);
+                rs.ctx.EndDraw(None,None)?;
+                rs.perf.borrow_mut().downsample += 1; c.input_frame = Some(key.frame);
+            }
+            if needs_raw_sharp {
+                if c.raw_sharp.is_none() { c.raw_sharp = Some(effect_bitmap(&rs.ctx, Extent { width:rs.width,height:rs.height })?); }
+                rs.ctx.SetTarget(c.raw_sharp.as_ref().unwrap()); rs.ctx.BeginDraw();
+                rs.ctx.DrawBitmap(&native,Some(&rect(rs.width,rs.height)),1.0,D2D1_INTERPOLATION_MODE_LINEAR,None,None);
+                rs.ctx.EndDraw(None,None)?;
+                rs.perf.borrow_mut().native_ingest += 1;
+                c.raw_frame = Some(key.frame);
+            }
+        }
+        if needs_sharp {
+            if c.sharp.is_none() { c.sharp = Some(effect_bitmap(&rs.ctx, Extent { width:rs.width,height:rs.height })?); }
+            paint_effect(rs, c.raw_sharp.as_ref().unwrap(), c.sharp.as_ref().unwrap(), key, None, Extent { width:rs.width,height:rs.height })?;
+            rs.perf.borrow_mut().sharp += 1; c.validity.sharp_done();
+        }
+        for index in 0..3 {
+            if needed[index] && c.validity.needs_band(index) {
+                if c.bands[index].is_none() { c.bands[index] = Some(effect_bitmap(&rs.ctx,plan.extent)?); }
+                paint_effect(rs, &c.input, c.bands[index].as_ref().unwrap(), key, Some(plan.stddev * (index+1) as f32 / 3.0), plan.extent)?;
+                rs.perf.borrow_mut().blur += 1; c.validity.band_done(index);
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn paint_effect(rs: &Render, input: &ID2D1Bitmap1, target: &ID2D1Bitmap1, key: EffectKey, sigma: Option<f32>, extent: Extent) -> windows::core::Result<()> {
+        let result = (|| -> windows::core::Result<()> {
+            rs.saturation.SetInput(0,input,true);
+            set_saturation(&rs.saturation, if key.desaturate {0.0} else {1.0});
+            let sat = rs.saturation.GetOutput()?;
+            let strength = f32::from_bits(key.tint[3]);
+            let source = if strength > 0.001 {
+                set_flood_color(&rs.flood,f32::from_bits(key.tint[0]),f32::from_bits(key.tint[1]),f32::from_bits(key.tint[2]));
+                rs.blend.SetInput(0,&sat,true); rs.blend.SetInput(1,&rs.flood.GetOutput()?,true);
+                rs.crossfade.SetInput(0,&rs.blend.GetOutput()?,true); rs.crossfade.SetInput(1,&sat,true);
+                set_crossfade_weight(&rs.crossfade,strength); rs.crossfade.GetOutput()?
+            } else { sat };
+            let output = if let Some(sigma) = sigma { rs.gaussian.SetInput(0,&source,true); set_blur(&rs.gaussian,sigma); rs.gaussian.GetOutput()? } else { source };
+            rs.ctx.SetTarget(target); rs.ctx.BeginDraw(); rs.ctx.Clear(Some(&transparent()));
+            rs.ctx.DrawImage(&output,None,Some(&rect(extent.width,extent.height)),D2D1_INTERPOLATION_MODE_LINEAR,D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            rs.ctx.EndDraw(None,None)
+        })();
+        // Break every effect's reference to the borrowed WGC surface, also on error.
+        rs.saturation.SetInput(0,None::<&ID2D1Image>,true);
+        rs.gaussian.SetInput(0,None::<&ID2D1Image>,true);
+        rs.blend.SetInput(0,None::<&ID2D1Image>,true); rs.blend.SetInput(1,None::<&ID2D1Image>,true);
+        rs.crossfade.SetInput(0,None::<&ID2D1Image>,true); rs.crossfade.SetInput(1,None::<&ID2D1Image>,true);
+        result
     }
 
     unsafe fn effect_bitmap(ctx: &ID2D1DeviceContext, extent: Extent) -> windows::core::Result<ID2D1Bitmap1> {
@@ -994,67 +928,6 @@ mod imp {
                 colorContext: std::mem::ManuallyDrop::new(None),
             },
         )
-    }
-
-    unsafe fn render_half_deep(rs: &Render, source: &ID2D1Image, plan: HalfDeepPlan)
-        -> windows::core::Result<Option<ID2D1Bitmap1>>
-    {
-        if rs.half_deep_unavailable.get() { return Ok(None); }
-        let ctx = &rs.ctx;
-        let mut storage = rs.half_deep.borrow_mut();
-        if storage.is_none() {
-            let allocate = (|| -> windows::core::Result<HalfDeepSurfaces> {
-                Ok(HalfDeepSurfaces {
-                    tinted_native: effect_bitmap(ctx, Extent { width: rs.width, height: rs.height })?,
-                    input: effect_bitmap(ctx, plan.extent)?,
-                    blurred: effect_bitmap(ctx, plan.extent)?,
-                })
-            })();
-            match allocate {
-                Ok(surfaces) => *storage = Some(surfaces),
-                Err(e) => {
-                    // Allocation is optional. Keep working at native resolution
-                    // and avoid retrying every frame until the worker is rebuilt.
-                    rs.half_deep_unavailable.set(true);
-                    log(&format!("half-size Deep allocation failed; using native blur: {e:?}"));
-                    return Ok(None);
-                }
-            }
-        }
-        let surfaces = storage.as_ref().unwrap();
-        let native_rect = D2D_RECT_F {
-            left: 0.0, top: 0.0, right: rs.width as f32, bottom: rs.height as f32,
-        };
-        let half_rect = D2D_RECT_F {
-            left: 0.0, top: 0.0,
-            right: plan.extent.width as f32, bottom: plan.extent.height as f32,
-        };
-        // All three passes use physical pixels (96 DPI) and identity transform.
-        // No effect or bitmap is ever sampled while it is the current target.
-        ctx.SetTarget(&surfaces.tinted_native);
-        ctx.BeginDraw();
-        ctx.Clear(Some(&transparent()));
-        ctx.DrawImage(source, None, Some(&native_rect),
-            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-        ctx.EndDraw(None, None)?;
-
-        ctx.SetTarget(&surfaces.input);
-        ctx.BeginDraw();
-        ctx.Clear(Some(&transparent()));
-        ctx.DrawBitmap(&surfaces.tinted_native, Some(&half_rect), 1.0,
-            D2D1_INTERPOLATION_MODE_LINEAR, Some(&native_rect), None);
-        ctx.EndDraw(None, None)?;
-
-        rs.gaussian.SetInput(0, &surfaces.input, true);
-        set_blur(&rs.gaussian, plan.stddev);
-        let output = rs.gaussian.GetOutput()?;
-        ctx.SetTarget(&surfaces.blurred);
-        ctx.BeginDraw();
-        ctx.Clear(Some(&transparent()));
-        ctx.DrawImage(&output, None, Some(&half_rect),
-            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-        ctx.EndDraw(None, None)?;
-        Ok(Some(surfaces.blurred.clone()))
     }
 
     fn transparent() -> D2D1_COLOR_F {

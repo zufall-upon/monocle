@@ -33,7 +33,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $listedTests | Write-Output
           $policyTests = @($listedTests | Select-String '^blur_policy::tests::.+: test$')
-          if ($policyTests.Count -lt 10) { throw "Expected at least 10 blur policy tests; refusing an empty or incomplete suite." }
+          if ($policyTests.Count -lt 13) { throw "Expected at least 13 blur policy tests; refusing an empty or incomplete suite." }
           $allTests = cargo test --locked --lib -- --list
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $isolationTests = @($allTests | Select-String '^(identity::tests|settings::tests|windows_api::tests|isolation_tests)::.+: test$')

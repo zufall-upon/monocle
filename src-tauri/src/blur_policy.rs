@@ -102,29 +102,35 @@ impl UpdateState {
     }
 }
 
-// Physical pixels: every bitmap and the D2D context explicitly use 96 DPI.
-// This conservative boundary is a starting quality policy, not a measured
-// perceptual guarantee. Weak blur and odd dimensions retain the native path.
-pub const HALF_BLUR_MIN_STDDEV: f32 = 8.0;
-
+// Exact physical-pixel ratios only: odd dimensions retain native quality.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HalfDeepPlan {
-    pub extent: Extent,
-    pub stddev: f32,
+pub struct ProcessingPlan { pub extent: Extent, pub divisor: u32, pub stddev: f32 }
+pub fn processing_plan(extent: Extent, sigma: f32) -> ProcessingPlan {
+    let divisor = if sigma.is_finite() && sigma >= 8.0 && extent.width >= 4 && extent.height >= 4 {
+        if extent.width % 4 == 0 && extent.height % 4 == 0 { 4 }
+        else if extent.width % 2 == 0 && extent.height % 2 == 0 { 2 } else { 1 }
+    } else { 1 };
+    ProcessingPlan { extent: Extent { width: extent.width / divisor, height: extent.height / divisor },
+        divisor, stddev: sigma.max(0.0) / divisor as f32 }
 }
 
-pub fn half_deep_plan(extent: Extent, stddev: f32, mode_mix: f64) -> Option<HalfDeepPlan> {
-    if !stddev.is_finite() || stddev < HALF_BLUR_MIN_STDDEV
-        || !mode_mix.is_finite() || mode_mix >= 0.999
-        || extent.width < 2 || extent.height < 2
-        || extent.width % 2 != 0 || extent.height % 2 != 0
-    {
-        return None;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EffectKey { pub frame: u64, pub sigma: u32, pub desaturate: bool, pub tint: [u32; 4] }
+
+#[derive(Default)]
+pub struct EffectValidity { key: Option<EffectKey>, valid: [bool; 3], sharp: bool }
+impl EffectValidity {
+    pub fn update(&mut self, key: EffectKey) {
+        if self.key != Some(key) { self.key = Some(key); self.valid = [false; 3]; self.sharp = false; }
     }
-    Some(HalfDeepPlan {
-        extent: Extent { width: extent.width / 2, height: extent.height / 2 },
-        stddev: stddev / 2.0,
-    })
+    pub fn needs_band(&self, index: usize) -> bool { !self.valid[index] }
+    pub fn band_done(&mut self, index: usize) { self.valid[index] = true; }
+    pub fn needs_sharp(&self) -> bool { !self.sharp }
+    pub fn sharp_done(&mut self) { self.sharp = true; }
+}
+
+pub fn required_bands(mix: f64, sigma: f32) -> [bool; 3] {
+    if sigma <= 0.0 { [false; 3] } else if mix > 0.001 { [true; 3] } else { [false, false, true] }
 }
 
 #[cfg(test)]
@@ -245,35 +251,52 @@ mod tests {
     }
 
     #[test]
-    fn half_plan_preserves_physical_sigma_and_exact_two_to_one_extent() {
-        for extent in [HD, UHD, Extent { width: 1080, height: 1920 }] {
-            let plan = half_deep_plan(extent, 24.0, 0.0).unwrap();
-            assert_eq!(plan.extent.width * 2, extent.width);
-            assert_eq!(plan.extent.height * 2, extent.height);
-            assert_eq!(plan.stddev * 2.0, 24.0);
+    fn processing_keeps_exact_physical_scale_at_edges_and_rotation() {
+        for extent in [HD, UHD, Extent { width: 1080, height: 1920 }, Extent { width: 1918, height: 1078 }] {
+            let p = processing_plan(extent, 24.0);
+            assert_eq!(p.extent.width * p.divisor, extent.width);
+            assert_eq!(p.extent.height * p.divisor, extent.height);
+            assert_eq!(p.stddev * p.divisor as f32, 24.0);
         }
     }
-
     #[test]
-    fn weak_blur_and_odd_or_invalid_extents_keep_native_path() {
-        for sigma in [0.0, 7.99, -1.0, f32::NAN, f32::INFINITY] {
-            assert!(half_deep_plan(HD, sigma, 0.0).is_none());
-        }
-        assert!(half_deep_plan(HD, HALF_BLUR_MIN_STDDEV, 0.0).is_some());
-        for extent in [Extent { width: 1919, height: 1080 },
-            Extent { width: 1920, height: 1079 }, Extent { width: 0, height: 1080 },
-            Extent { width: 1, height: 1 }]
-        {
-            assert!(half_deep_plan(extent, 24.0, 0.0).is_none());
-        }
+    fn weak_and_odd_blur_stay_native() {
+        assert_eq!(processing_plan(HD, 7.99).divisor, 1);
+        assert_eq!(processing_plan(HD, 8.0).divisor, 4);
+        assert_eq!(processing_plan(Extent { width: 1919, height: 1079 }, 24.0).divisor, 1);
+        assert_eq!(processing_plan(Extent { width: 2, height: 2 }, 24.0).divisor, 1);
     }
-
+    fn key(frame: u64) -> EffectKey { EffectKey { frame, sigma: 24f32.to_bits(), desaturate: false, tint: [0; 4] } }
     #[test]
-    fn ambient_is_never_replaced_by_the_half_deep_path() {
-        assert!(half_deep_plan(HD, 24.0, 1.0).is_none());
-        assert!(half_deep_plan(HD, 24.0, 0.999).is_none());
-        assert!(half_deep_plan(HD, 24.0, f64::NAN).is_none());
-        // During a crossfade only the separate Deep branch may use this plan.
-        assert!(half_deep_plan(HD, 24.0, 0.5).is_some());
+    fn fade_and_focus_updates_do_not_invalidate_effects() {
+        let mut cache = EffectValidity::default(); cache.update(key(1)); cache.band_done(2);
+        for _ in 0..100 { cache.update(key(1)); assert!(!cache.needs_band(2)); }
+        cache.update(key(2)); assert!(cache.needs_band(2));
+    }
+    #[test]
+    fn mode_transition_builds_only_missing_bands() {
+        let mut cache = EffectValidity::default(); cache.update(key(1));
+        assert_eq!(required_bands(0.0, 24.0), [false, false, true]);
+        cache.band_done(2);
+        let missing: Vec<_> = required_bands(0.5, 24.0).iter().enumerate().filter(|(i,v)| **v && cache.needs_band(*i)).map(|(i,_)| i).collect();
+        assert_eq!(missing, vec![0,1]);
+        cache.band_done(0); cache.band_done(1);
+        assert!((0..3).all(|i| !cache.needs_band(i)));
+        assert_eq!(required_bands(1.0, 0.0), [false; 3]);
+    }
+    #[test]
+    fn parameter_changes_invalidate_sharp_and_blur() {
+        let mut cache = EffectValidity::default(); cache.update(key(1)); cache.band_done(2); cache.sharp_done();
+        let mut changed = key(1); changed.tint[3] = 0.5f32.to_bits(); cache.update(changed);
+        assert!(cache.needs_sharp()); assert!(cache.needs_band(2));
+    }
+    #[test]
+    fn three_monitor_work_counts_exclude_idle_and_fade_only_blur() {
+        let mut caches: Vec<_> = (0..3).map(|_| EffectValidity::default()).collect();
+        let mut blur = 0;
+        for _tick in 0..200 { for cache in &mut caches { cache.update(key(1)); for i in 0..3 {
+            if required_bands(1.0,24.0)[i] && cache.needs_band(i) { blur += 1; cache.band_done(i); }
+        } } }
+        assert_eq!(blur, 9); // three levels once per monitor, not 4800 old draws
     }
 }

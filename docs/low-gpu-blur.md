@@ -1,162 +1,60 @@
-# Low-GPU blur experiment
+# Deep Lite renderer revision 2
 
-Deep Lite keeps Deep and Ambient blur, tint, desaturation, grain, the existing
-settings UI and window focus tracker. It is an experimental build, not a GPU-measured or Windows-runtime-validated
-release. Upstream: brycelewiswork/monocle,
-base commit `a1060b30c40f127b9796d7aed7eb3b9c4f6f7692` (MIT, Bryce Lewis).
+The first preview (`a6846a5`) was reported still too heavy by the user. Its successful build did not establish acceptable performance. This revision changes the rendering work, not just the 20 Hz update budget. No GPU percentage reduction is claimed.
 
-## What changed
+## Cost audit and changes
 
-- Each monitor consumes at most one newest queued frame on a 50 ms Win32 timer.
-  CopyResource, the effect chain and Present run at most once per timer tick.
-  The pool drain is bounded to its two buffers, avoiding producer starvation.
-- Request the same 50 ms minimum WGC update interval where the OS supports
-  IGraphicsCaptureSession5. Older systems fall back to consumer throttling.
-- After deactivation finishes fading, close the capture session. Recreate it on
-  activation. Also suspend when blur, desaturation and GPU tint are all off.
-- Reuse the last capture for settings/mode/fade changes; skip drawing/Present
-  when neither the capture nor shared state has changed. A resumed window stays
-  hidden until a fresh frame has been presented.
-- Monitor removal, addition, geometry changes and resume recreate per-monitor
-  resources. Failed workers retry on the next one-second reconciliation pass.
-  Validate capture dimensions before copying, and recover from COM/draw errors.
-- Resize the existing overlay/input/grain layers on display-change broadcasts;
-  release replaced grain bitmaps/DCs and refresh the focus tracker.
+| Path | First preview | Revision 2 |
+| --- | --- | --- |
+| D3D adapter | Default hardware adapter for every monitor | Match DXGI output HMONITOR to its adapter; log actual adapter/name/LUID and fallback |
+| Deep capture ingestion | Full-resolution CopyResource, native tint materialization, downsample | Direct WGC surface sampling into an owned working bitmap; compatibility copy only if direct wrapping fails |
+| Strong blur | Half width/height for Deep only | Quarter width/height for both modes when sigma >= 8 and dimensions divide by 4; half for even non-multiples of 4; odd/weak cases stay native |
+| Ambient | Native sharp base plus 8 native Gaussian levels | Native sharp base plus 3 cached Gaussian levels on the working surface |
+| Fade/mode transition | Live Gaussian evaluation on each draw | Composite completed bitmap caches; build only missing levels |
+| Focus movement | Globally invalidates drawing despite rectangles not being read | Geometry-only notification does not invalidate GPU pixels |
+| Disabled | Capture stopped, intermediate images retained | Capture stopped and working caches released after fade |
+| Retired overlay anchors | 10 transparent full-desktop windows | 1 transparent z-order anchor |
 
-The 50 ms timer is an upper-rate budget, not a guaranteed frame rate or latency.
-The focus tracker remains at its existing rate. Blur animation/background video
-can look less smooth at 20 updates/s. Static desktop savings depend on whether
-WGC supplies new frames; a repeated identical frame is not pixel-compared.
+Effect cache identity contains captured-frame generation, sigma, desaturation and tint. Fade and mode mix are not part of that identity. Deep uses the highest level shared with Ambient; entering Ambient adds only missing lower levels and its sharp base. Ambient with zero sigma has no Gaussian passes. Identical settings do not change the effect cache.
 
-## Half-size Deep blur
+WGC still captures at native monitor resolution. This is not a claim of smaller WGC capture or guaranteed removal of cross-adapter traffic. Direct2D's own Gaussian optimization may already pre-scale. Final swapchain/composition is native resolution. Capture consumption still has a 50 ms upper-rate budget; this is not the principal revision-2 change.
 
-Strong Deep blur now has a separate half-width, half-height path. The original
-saturation/tint graph is first materialized at native size and 96 DPI. This
-preserves the pixel scale of the existing DISSOLVE tint (despite old upstream
-comments describing it as an HSL Color blend). A second bitmap receives a 2:1
-linear downsample. Gaussian blur is then rendered into a third, half-size bitmap
-with half the original sigma. That completed bitmap is upscaled for composition.
-Every bitmap and the context use 96 DPI, so sigma corresponds to physical pixels;
-OS display scaling must not be applied a second time.
+## Lifetime and compatibility
 
-The quality policy keeps the native Deep path below sigma 8 (10% of STDDEV_MAX),
-for odd or smaller-than-two-pixel dimensions, and for non-finite parameters. The
-odd-size fallback avoids rounding, cropping or unequal X/Y scale factors. The
-threshold is conservative but not visually validated; changing across it needs
-an image-quality check. Allocation failure also falls back to native Deep until
-the worker is recreated. Offscreen drawing/device failures still trigger worker
-recovery rather than marking an unfinished frame as presented.
+WGC frames are released after source ingestion and EndDraw within the render tick. Effects are disconnected from borrowed input even on failure. Owned reduced input and completed results survive for subsequent composition. Ambient additionally caches native raw/processed sharp images. Entering Ambient or changing processing size without a current frame restarts capture to obtain a fresh native source; the existing displayed frame remains until that arrives.
 
-Ambient is unchanged: its sharp base, eight Gaussian bands and masks remain at
-native resolution. During a mode crossfade, only the separate Deep contribution
-uses the half-size path. Fade opacity is applied after upscaling, as before.
+If a driver cannot wrap the WGC surface as a D2D bitmap, a lazy owned native texture with CopyResource is used as a compatibility fallback. Its calls are counted. Draw/device errors still recreate the worker. Monitor topology/size changes recreate all resources. No OS GPU assignment is changed.
 
-The three extra bitmaps are allocated lazily when the half-size path is first
-used, reused until monitor-worker teardown, and remain allocated while inactive
-or in Ambient. They total 1.5 native BGRA surfaces: about 47.5 MiB per 3840x2160
-monitor, or 142.4 MiB for three such monitors, excluding driver padding and other
-resources. Three offscreen passes also add work. This is a memory/processing
-tradeoff; no net speedup has been measured. A future cache of completed blur
-results could avoid repeating these passes during fade-only updates.
+## Deliberate limitations
 
-## What did not change
+- Three Ambient levels change the progressive blur appearance. Tint DISSOLVE is evaluated at working resolution for blurred levels, so its texture can change. Ambient's sharp base remains native; separate film grain is retained.
+- Exact integer scaling preserves edge coverage and physical sigma; odd dimensions and weak blur retain the more expensive native path. DPI does not multiply sigma because all D2D bitmaps/contexts use 96 DPI.
+- No incoming frame and unchanged settings means no ingestion, Gaussian or Present. Fade-only updates composite cached results without Gaussian work. New WGC frames are conservatively treated as changed; repeated identical pixels with different frames are not detected by a CPU readback/hash.
+- Empty dirty-region metadata is **not** used to skip work: a throttled/dropping frame pool does not provide a proven cumulative-damage guarantee here.
+- Disabled/faded-out capture sessions stop. Fully occluded monitors are **not automatically suspended**: ordinary window style/rectangle tests cannot prove opacity (DWM glass and transparent composition exist). A proposed heuristic was removed during review to avoid disappearing backgrounds. Achieving zero capture for every hidden monitor remains unresolved.
+- Multiple monitor devices remain separate, now selected by owning output. Ambient's native caches add memory. Neither memory pressure nor performance on the user's mixed GPUs has been measured.
 
-WGC capture, CopyResource, final swapchain output and desktop composition remain
-full resolution. A smaller WGC frame-pool size would clip content, not downsample
-it. Only the eligible Deep Gaussian branch gets an explicit quarter-pixel-count
-working surface. Direct2D's default Gaussian optimization already performs
-internal pre-scaling in some cases, so that pixel ratio is not an estimate of
-overall GPU savings. Ambient's eight-band cost remains.
+## Counters and the minimum real-machine comparison
 
-The expected reduction is in repeated capture consumption, copies, effects and
-Present calls. WGC's internal work depends on OS support and the compositor.
-A 20 fps consumer does **not** imply a proportional reduction in total GPU load.
-No GPU utilization, power, VRAM or latency measurements have been obtained.
+`%TEMP%\deep-lite-gpu-blur.log` records actual adapter identity, optional API support and cumulative counters every 10 seconds per monitor:
 
-## Validation status
+- `capture`: frames acquired; `skipped`: older queued frames discarded.
+- `copy_resource`: compatibility full-texture copies (normally zero on the direct path).
+- `downsample`: owned working-input draws (native on weak/odd fallback).
+- `native_ingest`: native Ambient/zero-blur input-cache copies.
+- `sharp`: native sharp effect evaluations; `blur`: Gaussian bitmap evaluations.
+- `present`: swapchain calls; `starts`/`stops` and `session`: capture lifecycle.
 
-On the Ubuntu editing host: source/API review and `git diff --check` passed.
-Independent reviews covered recovery/topology and the subsequent half-size
-Deep path. The code adds error propagation, worker retries, fresh-frame show
-gating and overlay resizing. The half-size review checked target/input separation,
-pass boundaries, native Tint/Ambient preservation, fallback paths, and the binding
-between pure policy and the Windows renderer. API signatures were checked against
-windows 0.61.3/windows-core 0.61.2 source. The null-frame conversion is compared with `Error::empty().code()`, not
-an assumed E_POINTER HRESULT.
+Take differences between two log lines for the same monitor and worker, dividing by elapsed milliseconds. These are CPU-side submitted operation counts, **not GPU duration/utilization measurements**. New workers reset counters. Logs contain geometry/adapter names but no captured pixels or application content.
 
-Windows build/test/package execution is authorized on standard GitHub-hosted
-Windows runners for this public repository. The earlier `4a6c844` source compiled,
-passed all 10 blur-policy tests and packaged successfully in [run 37416035835](https://github.com/zufall-upon/monocle/actions/runs/37416035835).
-That build was not isolated from upstream settings and must not be used as the
-recommended preview. The isolated Deep Lite prerelease links its own successful
-CI run and exact SHA. No SDK was installed on the Ubuntu editing host, and no
-user-PC app was stopped, installed, overwritten or launched.
+For an authorized test, record only: preview SHA, mode/blur/tint settings, each display's resolution/scaling and logged adapter; 30 seconds disabled, 30 seconds static enabled, and 30 seconds of the same moving content in Deep then Ambient. Pair log deltas with Task Manager's per-process GPU/GPU-engine columns for Deep Lite and Desktop Window Manager. Do not attribute whole-adapter GPU percentages solely to this app. No user-machine measurement or executable launch is performed by CI.
 
-`src-tauri/src/blur_policy.rs` contains 10 unit tests covering static-frame reuse,
-settings updates, failed/overtaken presentation, fade-out/restart, rapid toggling,
-zero-blur with other effects, resize rejection, independent monitors, sigma and
-half dimensions, quality fallback and mode selection. Six further isolation
-tests cover installer identity, default autostart behavior, shared log/settings
-location, old-settings preservation/non-migration, filename-independent PID
-identity, and the Windows shared mutex. The file-preservation test only creates
-its own temporary fixture; the mutex test runs only inside the CI test process.
+## Verification boundaries
 
-The manual workflow refuses fewer than 10 policy or 6 isolation tests before
-running the library tests. Passing them does not verify WGC/Direct2D execution,
-20 Hz timing, visual quality, installer behavior on a user machine, or GPU savings.
+Pure Rust tests exercise source/draw lifecycle, cached effects across repeated composition, mode-level reuse, color invalidation, exact scaling/weak/odd/rotated extents and a deterministic three-monitor operation-count scenario. Isolation tests preserve separate settings/logs/Run identity and the shared single-instance mutex. Windows CI compiles, runs tests and packages; it does not exercise WGC, adapters, D2D, visual quality, occlusion or real GPU performance.
 
-## Isolation from upstream Deep
+Pending real-machine regression matrix: Deep/Ambient and interrupted crossfade; ON/OFF/rapid toggle; sigma below/at/above 8; tint/mono; 100/150/200% DPI; odd sizes and screen edges; 3→2→3 displays and rotation; sleep/resume/device errors; mixed-adapter displays; direct-wrap fallback; fresh frame on native-source re-entry. Source reviews and CI evidence are linked in the release for its exact commit.
 
-Deep Lite uses `%APPDATA%\DeepLite`, a `Deep Lite` Run value, product `Deep Lite`,
-identifier `io.github.zufallupon.deeplite`, and installed binary `deep-lite.exe`.
-Its GPU diagnostic log is `%TEMP%\deep-lite-gpu-blur.log`. Upstream settings are
-not imported, including when the fork's settings are absent or invalid. Fresh
-settings keep autostart OFF and startup performs no Run-key reconciliation in
-that state. Later explicit changes or an existing opt-in affect only the Deep Lite Run value.
+## Isolation and license
 
-The upstream mutex is deliberately retained to block simultaneous overlays
-before settings/log/autostart work. Failure to create that mutex also prevents
-startup. Neither app is stopped by the fork. Executable self-exclusion uses PID,
-so renaming a standalone binary does not change which process is considered self.
-See README and each package's BUILD-INFO for the installation/runtime limitations.
-
-## Windows acceptance matrix — all runtime cases pending
-
-Use a separately approved test machine/session. Keep the existing Deep settings
-and installation intact. The isolated preview has its own settings/install identity
-and deliberately refuses a second concurrent overlay through the shared mutex.
-A user-machine install or launch still requires separate authorization.
-
-| Case | Expected check |
-| --- | --- |
-| Start disabled, three monitors playing video | No WGC sessions until activation; no copy/effects/Present while idle |
-| Activate, deactivate, rapid toggles, zero/long fade | Fade completes; capture closes after fade-out; next activation uses fresh content |
-| Static desktop, then move a background window | No redundant Present on ticks with no frame or state change; new frames appear |
-| Change blur/tint/mono on static content | Cached capture redraws without requiring desktop movement |
-| Deep sigma just below/at/above 8, Tint off/on, mono | Native/half path transition has acceptable appearance; DISSOLVE grain scale stays stable |
-| Deep on even/odd dimensions and 100%/150%/200% display scaling | Exact coverage, no doubled sigma scaling, odd sizes use native fallback |
-| Deep→Ambient→Deep and crossfade | Ambient top remains sharp; no half-size target/graph leaks into its eight bands |
-| Half-size bitmap allocation failure | Native Deep continues without a per-frame allocation retry loop |
-| All GPU effects zero; restore blur | GPU window hides and capture closes; blur resumes correctly |
-| Deep ↔ Ambient including mid-transition toggles | Both treatments and tint/grain remain correct; no blank/stuck frame |
-| Window drag across screens; per-monitor/app-wide focus | Crisp focus group and original z-order/input behavior remain usable |
-| 3→2→3 screens, rotation, resolution/DPI/origin changes | No stale worker, mismatched copy, gap in grain/input layers, or sustained resource growth |
-| Sleep/resume, lock/unlock, capture/device error | Fresh capture returns; no permanent frozen image or unbounded error log |
-| Windows lacking MinUpdateInterval support | Capture still starts; the consumer budget remains effective |
-
-Compare upstream and fork separately with identical settings, resolution, refresh
-rate, video/application workload, power plan and driver. For Deep and Ambient,
-record at least 60 s after warm-up in disabled/static/moving/video states. Record
-whole-system and per-process GPU engines (3D/Copy), frame/present counts, CPU,
-dedicated/shared GPU memory, power if available, and perceived latency. Repeat
-three times, reporting medians/ranges rather than a single peak. Keep the Windows
-build result, runtime pass/fail matrix and measured savings as separate evidence.
-
-For the new path compare upstream, the 20 Hz commit `0689690`, and the half-size
-Deep revision separately. Include sigma 0/4/7.99/8/24/80, Tint off/on and Deep,
-Ambient and mode transitions. Record offscreen pass costs and the additional GPU
-memory as well as end-to-end results. Useful references: [WGC frame sizing and
-lifetime](https://learn.microsoft.com/en-us/windows/apps/develop/media-authoring-processing/screen-capture)
-and [Direct2D Gaussian optimization](https://learn.microsoft.com/en-us/windows/win32/direct2d/gaussian-blur).
-
-Final generated-installer review found NSIS removes the product-name Run value on uninstall. The application now uses `Deep Lite` for that value as well, with a regression assertion tying it to `productName`. The initial `8f08d0a` isolated CI passed all 16 tests, but is superseded by this packaging consistency correction.
+Settings/logs remain `%APPDATA%\DeepLite`; no old Deep configuration import. Autostart defaults OFF and uses Run value `Deep Lite`, matching installer cleanup. Product/binary/identifier remain Deep Lite / deep-lite.exe / io.github.zufallupon.deeplite. Shared mutex prevents simultaneous overlays without stopping the current app. Uninstall retains the settings/log directory. Upstream MIT copyright Bryce Lewis is preserved.
