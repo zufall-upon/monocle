@@ -1027,11 +1027,13 @@ unsafe fn reconcile_focus(groups: &mut HashMap<isize,Vec<isize>>, hwnds: &[isize
     let root = HWND(hwnds[0] as *mut _);
     // Reassert only actual violations, not the entire desktop every tracker tick.
     let targets=enumerate_effect_targets(hwnds);
+    let mut refusing=Vec::new();
     for &id in &targets {
         let hwnd = HWND(id as *mut _);
         let above = is_above_overlay(hwnd,root);
         if crate::focus_policy::must_lower(id,&sharp,ignored,above) {
             push_below_overlay(hwnd,root);
+            if is_above_overlay(hwnd,root) {refusing.push(id);}
         } else if sharp.contains(&id) && !above {
             let insert_after = if is_eligible_window(foreground,hwnds) && foreground != hwnd { foreground } else { HWND_TOP };
             let _ = SetWindowPos(hwnd,Some(insert_after),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
@@ -1040,10 +1042,10 @@ unsafe fn reconcile_focus(groups: &mut HashMap<isize,Vec<isize>>, hwnds: &[isize
     // A successful SetWindowPos need not put the foreign HWND below us. Move
     // only our divider, and only if all sharp/ignored windows can remain above
     // it. One relocation per reconciliation; remaining targets follow next tick.
-    if DIVIDER_FALLBACK_BLOCKED.load(Ordering::Relaxed) {return;}
+    if refusing.is_empty() || DIVIDER_FALLBACK_BLOCKED.load(Ordering::Relaxed) {return;}
     let protected:Vec<_>=sharp.iter().chain(ignored.iter()).copied()
         .filter(|&id|IsWindowVisible(HWND(id as *mut _)).as_bool() && !IsIconic(HWND(id as *mut _)).as_bool()).collect();
-    for id in targets {
+    for id in refusing {
         if sharp.contains(&id) || ignored.contains(&id) {continue;}
         let target=HWND(id as *mut _);
         if !is_effect_target(target) || !is_above_overlay(target,root) {continue;}
