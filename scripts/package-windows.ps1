@@ -28,14 +28,15 @@ $signatures = Get-ChildItem "$destination/*.exe" | ForEach-Object {
     "$($_.Name): $($signature.Status)"
 }
 $info = @"
-Deep Lite experimental Windows x64 build
+Deep Lite 0.1.1 — Windows x64 build
 Source commit: $sha
 Source: https://github.com/$env:GITHUB_REPOSITORY/commit/$sha
 CI: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
 
 Compiled and packaged with the Tauri CLI on a standard GitHub-hosted Windows runner.
 Rust policy tests passed in this run; GPU/UI runtime was NOT exercised.
-PLACEMENT REPAIR PREVIEW: Firefox real-PC resolution is NOT confirmed.
+Behavior matches Preview 7 (5da199958507), reported working by the user.
+This rebuilt release binary has not itself been tested on that PC.
 Moves our divider above a refusing background only when protected windows stay above.
 Bounded before/after/next-tick placement samples appear in Show focus diagnostics.
 Independent shared-owner demotion repair included; no settings reset required.
@@ -47,14 +48,15 @@ and hidden-owner grouping are repaired. Rebuilds now preserve real focus and ref
 Ignored caches from versioned snapshots. No saved exclusions are auto-removed.
 Topmost windows remain outside the effect.
 The native WindowFromPoint fixture does not establish real desktop gesture behavior.
-Actual Firefox/Tablacus, 3-monitor operation and GPU savings remain unverified.
+Native fixtures are not real Firefox/Tablacus integration tests.
+Complete 3-monitor coverage and measured GPU savings remain unverified.
 Operation counters: %TEMP%\deep-lite-gpu-blur.log (10-second cumulative samples).
 Fully occluded monitors are not automatically suspended.
 No code-signing certificate was supplied. Authenticode status:
 $($signatures -join "`n")
 
-Windows three-monitor behavior, visual quality, capture suspension/resume and
-actual GPU savings remain unverified. This is an experimental prerelease.
+Full multi-monitor visual/lifecycle validation and actual GPU savings remain
+unverified. No quantitative performance improvement is claimed.
 The standalone exe requires the Microsoft Edge WebView2 runtime.
 
 Deep Lite is separated from upstream Deep:
