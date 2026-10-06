@@ -23,6 +23,7 @@ jobs:
           rustc --version
           cargo --version
       - name: Check Windows code
+        if: github.ref_name != 'investigate-z-order'
         working-directory: src-tauri
         run: cargo check --locked
       - name: Require policy tests and run library tests

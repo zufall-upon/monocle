@@ -54,6 +54,28 @@ unsafe fn dump(stage: &str, named: &[(&str,HWND)]) {
     println!("{stage}: {}",order.iter().map(|(n,_)|*n).collect::<Vec<_>>().join(" > "));
 }
 
+unsafe fn reconcile_model(root: HWND, sharp: HWND, targets: &[HWND], gpu: &[Window], stage: &str, named: &[(&str,HWND)]) {
+    for tick in 0..4 {
+        for g in gpu { place(g.0,root); }
+        // EnumWindows-style snapshot; production iterates this original order
+        // even when earlier moves change later HWND positions.
+        let mut ordered=targets.to_vec();
+        ordered.sort_by(|a,b|if a==b {std::cmp::Ordering::Equal} else if above(*a,*b) {std::cmp::Ordering::Less} else {std::cmp::Ordering::Greater});
+        for h in ordered {
+            let is_above=above(h,root);
+            if crate::focus_policy::must_lower(h.0 as isize,&[sharp.0 as isize],&[],is_above) {
+                app_place(h,root,true);
+            } else if h==sharp && !is_above {
+                app_place(h,HWND_TOP,false);
+            }
+        }
+        pump();
+        dump(&format!("{stage}-reconcile-{tick}"),named);
+    }
+    // Re-pin on the subsequent 16 ms tracker tick (reconcile is 250 ms).
+    for g in gpu { place(g.0,root); }
+}
+
 #[test]
 fn native_three_gpu_windows_with_ignored_owner_and_settings_transitions() {
     unsafe {
@@ -100,8 +122,9 @@ fn native_three_gpu_windows_with_ignored_owner_and_settings_transitions() {
         }
         // Actual settings activation, retain active anchor, then return.
         focus(settings.0); pin_gpu(); focus(active.0); pin_gpu();
-        dump("settings-return",&named);
-        for g in &gpu { check!(!above(background.0,g.0),"background above GPU after settings return"); }
+        dump("settings-return-immediate",&named);
+        reconcile_model(root.0,active.0,&[active.0,popup.0,background.0],&gpu,"settings-return",&named);
+        for g in &gpu { check!(!above(background.0,g.0),"background above GPU after settings reconciliation"); }
         // Activate the owner family, then another app: same demotion sequence
         // as the foreground tracker (owner first in the focused group).
         focus(background.0); app_place(popup.0,background.0,false); pin_gpu();
@@ -109,13 +132,7 @@ fn native_three_gpu_windows_with_ignored_owner_and_settings_transitions() {
         dump("immediately-after-demotion",&named);
         println!("root boundary says background above={} while GPU0 above={}",
             above(background.0,root.0),above(background.0,gpu[0].0));
-        // Model two complete tracker ticks, not just the immediate transient.
-        for _ in 0..2 {
-            pin_gpu();
-            if !above(ignored.0,root.0) { app_place(ignored.0,HWND_TOP,false); }
-            for h in [popup.0,background.0] { if above(h,root.0) { app_place(h,root.0,true); } }
-            pump();
-        }
+        reconcile_model(root.0,active.0,&[active.0,popup.0,background.0],&gpu,"demotion",&named);
         dump("settled",&named);
         check!(!above(background.0,root.0),"inactive owner remains above root");
         check!(!above(popup.0,root.0),"inactive popup remains above root");
@@ -134,7 +151,7 @@ fn native_three_gpu_windows_with_ignored_owner_and_settings_transitions() {
         assert_eq!(anchors,vec![(1,ignored.0.0 as isize)]);
         for h in [background.0,popup.0,active.0] { app_place(h,root.0,true); }
         focus(settings.0); pin_gpu(); focus(ignored.0);
-        for _ in 0..2 { pin_gpu(); pump(); }
+        reconcile_model(root.0,ignored.0,&[ignored.0,active.0,popup.0,background.0],&gpu,"ignored-return",&named);
         dump("ignored-settings-return-settled",&named);
         for h in [background.0,popup.0,active.0] {
             check!(!above(h,root.0),"old normal app remains above root after ignored focus");
@@ -146,7 +163,7 @@ fn native_three_gpu_windows_with_ignored_owner_and_settings_transitions() {
         check!(WindowFromPoint(POINT{x:120,y:320})==background.0,"visual input target changed");
         }
         println!("owner_mode={owner_mode} violations={violations:?}");
-        if owner_mode==3 { assert!(violations.is_empty(),"owner-preserving candidate did not satisfy ordering"); }
+        if owner_mode==1 || owner_mode==3 { assert!(violations.is_empty(),"owner-preserving candidate did not satisfy ordering"); }
         else if owner_mode==0 { assert!(!violations.is_empty(),"baseline owner coupling was not reproduced"); }
         }
     }
