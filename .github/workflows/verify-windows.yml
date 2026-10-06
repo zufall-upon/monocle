@@ -1,6 +1,6 @@
 name: Verify Windows source
 
-# Explicit dispatch only: no installer publication and no automatic build on push.
+# Explicit dispatch only. Builds artifacts; releases are published separately.
 on:
   workflow_dispatch:
 
@@ -10,9 +10,14 @@ permissions:
 jobs:
   verify:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install locked frontend and official Tauri CLI dependencies
+        run: npm ci
       - name: Show preinstalled toolchain
         run: |
           rustc --version
@@ -30,6 +35,19 @@ jobs:
           $policyTests = @($listedTests | Select-String '^blur_policy::tests::.+: test$')
           if ($policyTests.Count -lt 10) { throw "Expected at least 10 blur policy tests; refusing an empty or incomplete suite." }
           cargo test --locked --lib
-      - name: Build Windows executable without installer
-        working-directory: src-tauri
-        run: cargo build --locked --release
+      - name: Build Windows executable and NSIS installer
+        run: npm run build -- --ci --bundles nsis -- --locked
+      - name: Package executable with source SHA, hashes and limitations
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - name: Upload verified build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: monocle-windows-x64-${{ github.sha }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.txt
+            dist/LICENSE
+          if-no-files-found: error
+          retention-days: 1
