@@ -37,7 +37,11 @@ jobs:
           $allTests = cargo test --locked --lib -- --list
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $isolationTests = @($allTests | Select-String '^(identity::tests|settings::tests|windows_api::tests|isolation_tests)::.+: test$')
-          if ($isolationTests.Count -lt 6) { throw "Expected at least 6 isolation tests." }
+          if ($isolationTests.Count -lt 7) { throw "Expected at least 7 isolation/settings tests." }
+          $focusTests = @($allTests | Select-String '^focus_policy::tests::.+: test$')
+          if ($focusTests.Count -lt 6) { throw "Expected at least 6 focus reconciliation tests." }
+          $rendererTests = @($allTests | Select-String '^renderer_policy::tests::.+: test$')
+          if ($rendererTests.Count -lt 4) { throw "Expected at least 4 renderer lifecycle tests." }
           cargo test --locked --lib
       - name: Build Windows executable and NSIS installer
         run: npm run build -- --ci --bundles nsis -- --locked

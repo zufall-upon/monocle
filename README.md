@@ -1,12 +1,30 @@
 # Deep Lite
 
-An experimental low-GPU fork of [Deep / Monocle](https://github.com/brycelewiswork/monocle)
-by Bryce Lewis. Keeps background blur, focus tracking, tint, grain and the settings
-UI on Windows 10/11 x64. Upstream's MIT license is retained in [LICENSE](LICENSE).
+An experimental focus-overlay fork of [Deep / Monocle](https://github.com/brycelewiswork/monocle)
+by Bryce Lewis for Windows 10/11 x64. Upstream's MIT license is retained in [LICENSE](LICENSE).
 
-**Windows compilation and policy tests do not establish GPU savings or runtime
-quality.** Three-monitor behavior, visual quality and GPU/power measurements still
-need validation. See [implementation and validation notes](docs/low-gpu-blur.md).
+## Capture-free preview
+
+**Static mask is now the default**, including when upgrading old Deep Lite settings.
+Choose Solid, Stripes or Grid; Tint controls its color and opacity. This dims/masks
+background apps rather than blurring their pixels. Live blur is still selectable
+under Renderer, with previous blur preferences preserved.
+
+Static mode creates no WGC sessions or D3D/Direct2D blur workers, performs no
+screen copies, Gaussian passes or swap-chain Presents, and allocates no grain
+bitmap. Windows caches the GDI overlay fill; settings/display changes repaint it
+and fades change its alpha. Focus tracking still runs; DWM still composites the
+windows. **GPU-zero and a measured speedup are not claimed.**
+
+Switching to Static tears down live GPU workers; disabling Live blur tears them
+down after fade-out. Switching back creates fresh resources for current monitors.
+The browser-focus repair reconciles stale window membership/z-order every 250 ms.
+Per-monitor focus intentionally keeps a sharp window on each monitor: turn it OFF
+for only one global focused group. App-wide focus and Ignored apps also expand
+what stays sharp. See [investigation and runtime checklist](docs/capture-free-options.md).
+
+Windows compilation and policy tests do not establish actual GPU/power savings,
+visual quality or real three-monitor behavior. Runtime validation remains pending.
 
 ## Renderer revision 2
 
@@ -83,7 +101,8 @@ The binary is `src-tauri/target/release/deep-lite.exe`; the installer is under
 `src-tauri/target/release/bundle/nsis/`. Compilation does not launch the app.
 
 The manual [Windows workflow](.github/workflows/verify-windows.yml) checks the
-Windows code, requires at least 14 blur-policy and 6 isolation tests, runs the
+Windows code, requires at least 14 blur-policy, 7 isolation/settings, 6 focus and
+4 renderer-lifecycle tests, runs the
 library tests, builds/packages the exe and installer, and records source SHA,
 Authenticode status and hashes. It uses a standard GitHub-hosted Windows runner
 in this public repository. Releases link the successful run for their exact SHA.

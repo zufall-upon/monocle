@@ -35,8 +35,12 @@ CI: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
 
 Compiled and packaged with the Tauri CLI on a standard GitHub-hosted Windows runner.
 Rust policy tests passed in this run; GPU/UI runtime was NOT exercised.
-Renderer revision 2: direct ingestion, effect caches, three-level Ambient,
-output-adapter selection. This is NOT evidence of measured GPU savings.
+Capture-free preview: Static mask defaults ON as the renderer selection.
+The app itself starts inactive. Renderer can be changed to Live blur in settings.
+Static uses Solid/Stripes/Grid GDI fills; it does NOT blur background pixels.
+Static creates no WGC/D3D blur workers. DWM still composites the overlay.
+Live retains revision 2 optimizations. This is NOT measured GPU savings.
+Focus lifecycle/z-order repair is included; Win32/browser behavior is untested.
 Operation counters: %TEMP%\deep-lite-gpu-blur.log (10-second cumulative samples).
 Fully occluded monitors are not automatically suspended.
 No code-signing certificate was supplied. Authenticode status:

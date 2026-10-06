@@ -1,9 +1,10 @@
+mod renderer_policy;
+mod focus_policy;
 #[cfg(any(windows, test))]
 mod blur_policy;
 mod gpu_blur;
 mod identity;
 mod logging;
-mod magnifier;
 mod overlay;
 mod settings;
 mod shake;
@@ -423,11 +424,8 @@ pub fn run() {
             // them, so accidental UI hits behind the blur don't fire.
             overlay::init();
 
-            // Magnification-API-based desaturation backdrop. Retained but
-            // no longer driven — desaturation now happens natively inside
-            // the GPU blur pass (gpu_blur). Kept compiled so we can fall
-            // back while the new path is proven; slated for removal.
-            magnifier::init();
+            // The retired Magnification path is not initialized. Desaturation
+            // is handled by the selected renderer, not an unused capture host.
 
             // GPU blur layer: per-monitor DirectComposition windows that
             // capture the screen, run a Saturation -> Gaussian Direct2D
@@ -440,7 +438,8 @@ pub fn run() {
             // capture so it isn't blurred/haloed when shown over the overlay.
             // Maps to SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) on Windows.
             if let Some(settings_win) = app.get_webview_window("settings") {
-                let _ = settings_win.set_content_protected(true);
+                let protected = settings_win.set_content_protected(true);
+                logging::log(&format!("settings capture exclusion requested: {protected:?}"));
                 // Register its HWND so the overlay keeps it above the blur and
                 // excludes it from all focus/z-order mechanics.
                 #[cfg(windows)]

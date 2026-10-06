@@ -21,6 +21,14 @@ async function init() {
 }
 
 function applySettingsToUI(s) {
+  const live = s.effect_renderer === "blur";
+  document.getElementById("effect-renderer").value = live ? "blur" : "mask";
+  document.getElementById("mask-pattern").value = s.mask_pattern || "solid";
+  document.getElementById("mask-options").hidden = live;
+  ["blur-intensity", "grain-amount", "desaturate-enabled"].forEach(id => {
+    document.getElementById(id).disabled = !live;
+  });
+  document.querySelectorAll("#blur-mode .seg-btn").forEach(btn => { btn.disabled = !live; });
   document.getElementById("tint-opacity").value = s.tint_opacity * 100;
 
   document.getElementById("blur-intensity").value = s.gpu_blur_intensity * 100;
@@ -94,6 +102,13 @@ function bindSlider(id, key, displayId) {
   });
 }
 
+for (const [id, key] of [["effect-renderer", "effect_renderer"], ["mask-pattern", "mask_pattern"]]) {
+  document.getElementById(id).addEventListener("change", e => {
+    settings[key] = e.target.value;
+    applySettingsToUI(settings);
+    saveSettings();
+  });
+}
 bindSlider("tint-opacity", "tint_opacity");
 bindSlider("blur-intensity", "gpu_blur_intensity");
 bindSlider("grain-amount", "grain_amount");

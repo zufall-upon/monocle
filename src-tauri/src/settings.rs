@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 fn default_fade_duration_secs() -> f64 { 0.75 }
 fn default_gpu_blur_intensity() -> f64 { 0.3 }
+fn default_effect_renderer() -> String { "mask".into() }
+fn default_mask_pattern() -> String { "solid".into() }
 fn default_blur_mode() -> String { "deep_focus".into() }
 fn default_toggle_shortcut() -> String { "Ctrl+Alt+Win+F".into() }
 fn default_mode_shortcut() -> String { "Ctrl+Alt+Win+M".into() }
@@ -19,6 +21,11 @@ pub struct IgnoredApp {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    /// Missing/unknown values select the capture-free renderer.
+    #[serde(default = "default_effect_renderer")]
+    pub effect_renderer: String,
+    #[serde(default = "default_mask_pattern")]
+    pub mask_pattern: String,
     // GPU Gaussian blur strength (0..1 -> stddev 0..STDDEV_MAX). The
     // capture-based blur (gpu_blur) — the only blur now; the old acrylic
     // `blur_enabled`/`blur_intensity` settings have been retired.
@@ -69,6 +76,8 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            effect_renderer: default_effect_renderer(),
+            mask_pattern: default_mask_pattern(),
             gpu_blur_intensity: default_gpu_blur_intensity(),
             blur_mode: default_blur_mode(),
             grain_amount: 0.5,
@@ -119,6 +128,24 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renderer_migration_defaults_to_static_and_preserves_blur_preferences() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("effect_renderer");
+        value.as_object_mut().unwrap().remove("mask_pattern");
+        value["gpu_blur_intensity"] = serde_json::json!(0.83);
+        let migrated: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(migrated.effect_renderer, "mask");
+        assert_eq!(migrated.mask_pattern, "solid");
+        assert_eq!(migrated.gpu_blur_intensity, 0.83);
+        let mut selected = migrated;
+        selected.effect_renderer = "blur".into();
+        selected.mask_pattern = "grid".into();
+        let restored: AppSettings = serde_json::from_str(&serde_json::to_string(&selected).unwrap()).unwrap();
+        assert_eq!(restored.effect_renderer, "blur");
+        assert_eq!(restored.mask_pattern, "grid");
+    }
 
     #[test]
     fn legacy_settings_are_neither_imported_nor_modified() {

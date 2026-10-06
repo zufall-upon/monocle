@@ -46,6 +46,22 @@
 
     <div class="controls">
       <div class="control-group">
+        <label for="effect-renderer">Renderer</label>
+        <select id="effect-renderer">
+          <option value="mask">Static mask (no capture)</option>
+          <option value="blur">Live blur</option>
+        </select>
+        <div id="mask-options">
+          <label for="mask-pattern">Mask pattern</label>
+          <select id="mask-pattern">
+            <option value="solid">Solid</option>
+            <option value="stripes">Stripes</option>
+            <option value="grid">Grid</option>
+          </select>
+          <p style="font-size:12px;opacity:.7">Dims the background without blurring it. Tint sets color and opacity.</p>
+        </div>
+      </div>
+      <div class="control-group">
         <div class="tint-control" id="tint-control">
           <div class="control-row tint-main">
             <button class="swatch-current control-icon" id="swatch-current" style="background:#0f172a" title="Tint color"></button>
@@ -144,12 +160,12 @@
             Mono
           </label>
           <label class="checkbox-label">
-            <input type="checkbox" id="per-monitor-focus" checked />
+            <input type="checkbox" id="per-monitor-focus" checked title="Keeps the last focused window on every monitor sharp. Turn off for one focused window across all monitors." />
             <span class="checkmark"></span>
             Per-monitor focus
           </label>
           <label class="checkbox-label">
-            <input type="checkbox" id="app-wide-focus" />
+            <input type="checkbox" id="app-wide-focus" title="Keeps other windows of the same process sharp too." />
             <span class="checkmark"></span>
             App-wide focus
           </label>

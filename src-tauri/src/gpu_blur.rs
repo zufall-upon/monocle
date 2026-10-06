@@ -76,6 +76,16 @@ pub fn set_focus_rects(rects: &[(i32, i32, i32, i32)]) {
     imp::set_focus_rects(rects);
 }
 
+#[cfg(windows)]
+pub fn set_renderer_enabled(enabled: bool) { imp::set_renderer_enabled(enabled); }
+#[cfg(not(windows))]
+pub fn set_renderer_enabled(_enabled: bool) {}
+
+#[cfg(windows)]
+pub fn set_capture_allowed(allowed: bool) { imp::set_capture_allowed(allowed); }
+#[cfg(not(windows))]
+pub fn set_capture_allowed(_allowed: bool) {}
+
 #[cfg(not(windows))]
 pub fn init() {}
 #[cfg(not(windows))]
@@ -181,6 +191,10 @@ mod imp {
     static TINT_G_BITS: AtomicU32 = AtomicU32::new(0);
     static TINT_B_BITS: AtomicU32 = AtomicU32::new(0);
     static TINT_STRENGTH_BITS: AtomicU32 = AtomicU32::new(0);
+    static RENDERER_ENABLED: AtomicBool = AtomicBool::new(false);
+    static WAKE: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::OnceLock::new();
+    fn wake() { if let Some(tx) = WAKE.get() { let _ = tx.send(()); } }
+    static CAPTURE_ALLOWED: AtomicBool = AtomicBool::new(false);
     static ACTIVE: AtomicBool = AtomicBool::new(false);
     // Every live blur window, so sync()/reassert_z() can address them all.
     static WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
@@ -220,7 +234,10 @@ mod imp {
 
     pub fn set_fade(progress: f64) {
         if FADE_BITS.swap(progress.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed)
-            != progress.clamp(0.0, 1.0).to_bits() { sync(); }
+            != progress.clamp(0.0, 1.0).to_bits() {
+            sync();
+            if progress <= 0.0 { wake(); }
+        }
     }
 
     pub fn set_tint(r: f32, g: f32, b: f32, strength: f32) {
@@ -232,7 +249,7 @@ mod imp {
     }
 
     pub fn set_active(active: bool) {
-        if ACTIVE.swap(active, Ordering::Relaxed) != active { sync(); }
+        if ACTIVE.swap(active, Ordering::Relaxed) != active { sync(); wake(); }
     }
 
     pub fn set_focus_rects(rects: &[(i32, i32, i32, i32)]) {
@@ -243,6 +260,16 @@ mod imp {
         *cur = rects.to_vec();
         drop(cur);
         // Rectangles currently do not alter pixels. Do not invalidate every GPU.
+    }
+
+    pub fn set_renderer_enabled(enabled: bool) {
+        if RENDERER_ENABLED.swap(enabled,Ordering::Relaxed) != enabled {
+            sync(); wake();
+        }
+    }
+
+    pub fn set_capture_allowed(allowed: bool) {
+        if CAPTURE_ALLOWED.swap(allowed,Ordering::Relaxed) != allowed { sync(); wake(); }
     }
 
     fn sync() {
@@ -272,15 +299,20 @@ mod imp {
     pub fn init() {
         // Reconcile monitor handles AND geometry. Recreate resources on resize,
         // rotation, reconnect and resume instead of copying mismatched textures.
-        std::thread::spawn(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if WAKE.set(tx).is_err() { return; }
+        std::thread::spawn(move || {
+            let mut last_count = usize::MAX;
             let mut workers: Vec<(isize, windows::Win32::Foundation::RECT,
                 Arc<AtomicBool>, std::thread::JoinHandle<()>)> = Vec::new();
             loop {
                 let mut monitors: Vec<(isize, windows::Win32::Foundation::RECT)> = Vec::new();
-                unsafe {
+                if crate::renderer_policy::needs_workers(
+                    RENDERER_ENABLED.load(Ordering::Relaxed), ACTIVE.load(Ordering::Relaxed),
+                    fade(), CAPTURE_ALLOWED.load(Ordering::Relaxed)) { unsafe {
                     let _ = EnumDisplayMonitors(None, None, Some(monitor_enum),
                         LPARAM(&mut monitors as *mut _ as isize));
-                }
+                }}
                 let mut i = 0;
                 while i < workers.len() {
                     let (handle, rect, _, thread) = &workers[i];
@@ -302,7 +334,13 @@ mod imp {
                         workers.push((hmon, rect, stop, thread));
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                if last_count != workers.len() {
+                    last_count = workers.len();
+                    log(&format!("renderer={} gpu_workers={last_count}",
+                        if RENDERER_ENABLED.load(Ordering::Relaxed) { "live" } else { "static" }));
+                }
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+                while rx.try_recv().is_ok() {}
             }
         });
     }
@@ -362,6 +400,7 @@ mod imp {
         width: u32,
         height: u32,
         shown: Cell<bool>,
+        last_work: Cell<std::time::Instant>,
     }
 
     impl Drop for Render {
@@ -424,7 +463,18 @@ mod imp {
 
         // Exclude from screen capture: the pipeline must never feed our own
         // output back in.
-        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        let set_ok = SetWindowDisplayAffinity(hwnd,WDA_EXCLUDEFROMCAPTURE).is_ok();
+        let mut affinity = 0u32;
+        // Readback is documented for layered windows. This DComp HWND has
+        // NOREDIRECTIONBITMAP, not LAYERED; failed readback is not Set failure.
+        let readback = GetWindowDisplayAffinity(hwnd,&mut affinity).is_ok();
+        let excluded = set_ok && (!readback || affinity == WDA_EXCLUDEFROMCAPTURE.0);
+        log(&format!("capture exclusion hwnd={:#x} set_ok={} readback={} affinity={affinity:#x} allowed={}",hwnd.0 as isize,set_ok,readback,excluded));
+        if !excluded {
+            // Never start capture that can feed our own output back into itself.
+            let _ = DestroyWindow(hwnd);
+            return;
+        }
 
         WINDOWS.lock().unwrap().push(hwnd.0 as isize);
 
@@ -659,6 +709,7 @@ mod imp {
                 width,
                 height,
                 shown: Cell::new(false),
+                last_work: Cell::new(std::time::Instant::now()),
             });
         });
         Ok(())
@@ -725,6 +776,10 @@ mod imp {
             rs.perf.borrow_mut().starts += 1;
             *rs.session.borrow_mut() = Some(session);
         }
+        // WM_TIMER is only a wake-up. Enforce elapsed time as well, so delayed
+        // or coalesced timer delivery cannot cause catch-up rendering bursts.
+        if rs.last_work.get().elapsed().as_millis() < u128::from(FRAME_INTERVAL_MS) { return Ok(()); }
+        rs.last_work.set(std::time::Instant::now());
         // Frames live only through this tick's source ingestion. EndDraw before
         // Close; no borrowed WGC surface survives in an effect or cached image.
         let mut newest: Option<Direct3D11CaptureFrame> = None;
@@ -1017,6 +1072,7 @@ mod imp {
     // show state to match. Visible whenever the overlay is active or still
     // fading out.
     fn wants_capture() -> bool {
+        if !RENDERER_ENABLED.load(Ordering::Relaxed) || !CAPTURE_ALLOWED.load(Ordering::Relaxed) { return false; }
         CaptureDemand {
             active: ACTIVE.load(Ordering::Relaxed),
             fade: fade(),

@@ -719,3 +719,11 @@ input[type="range"]::-webkit-slider-thumb:active {
   background: #222;
   border-radius: 2px;
 }
+
+/* Renderer choices follow the existing compact dark settings panel. */
+#effect-renderer, #mask-pattern {
+  display: block; width: 100%; margin: 8px 0 12px; padding: 8px;
+  color: inherit; background: #20232a; border: 1px solid #454955;
+  border-radius: 6px; font: inherit;
+}
+input:disabled, button:disabled { opacity: .35; cursor: default; }

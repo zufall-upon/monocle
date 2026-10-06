@@ -21,8 +21,7 @@ const BLUR_LAYERS: usize = 1;
 // [0]=transparent anchor, [1]=tint/input, [2]=grain
 // Each window owns the next, so owned windows are always above owner.
 // Pushing behind [0] = behind the entire group.
-// (Desaturation is handled separately by the Magnification API in the
-// `magnifier` module — see there.)
+// Live desaturation is handled by the optional GPU renderer.
 const TOTAL_WINDOWS: usize = BLUR_LAYERS + 2;
 const TINT_IDX: usize = BLUR_LAYERS;
 const GRAIN_IDX: usize = BLUR_LAYERS + 1;
@@ -54,6 +53,8 @@ const TINT_STRENGTH_MAX: f32 = 0.50;
 
 static ALL_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 static DISPLAY_DIRTY: AtomicBool = AtomicBool::new(false);
+static STATIC_MASK: AtomicBool = AtomicBool::new(true);
+static MASK_PATTERN: AtomicI32 = AtomicI32::new(0);
 static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // Every HWND we've SetWindowPos'd below root_overlay during a session.
@@ -556,7 +557,7 @@ fn should_skip_window(hwnd: HWND) -> bool {
 #[cfg(windows)]
 fn looks_like_real_app_window(hwnd: HWND) -> bool {
     unsafe {
-        if !IsWindowVisible(hwnd).as_bool() { return false; }
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() { return false; }
         let mut cloaked: u32 = 0;
         let _ = DwmGetWindowAttribute(
             hwnd, DWMWA_CLOAKED,
@@ -581,7 +582,7 @@ fn is_eligible_window(hwnd: HWND, all_hwnds: &[isize]) -> bool {
         // tracker), so it must never be an anchor, group member, or demote
         // target.
         if hwnd_val == SETTINGS_HWND.load(Ordering::Relaxed) { return false; }
-        if !IsWindowVisible(hwnd).as_bool() { return false; }
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() { return false; }
         if should_skip_window(hwnd) { return false; }
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
         if ex_style & WS_EX_TOOLWINDOW.0 != 0 { return false; }
@@ -658,10 +659,13 @@ unsafe fn push_below_overlay(target: HWND, root_overlay: HWND) {
     if is_ignored_hwnd(target.0 as isize) {
         return;
     }
-    let _ = SetWindowPos(
+    if let Err(error) = SetWindowPos(
         target, Some(root_overlay), 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-    );
+    ) {
+        crate::logging::log(&format!("focus demotion failed hwnd={:#x}: {error:?}",target.0 as isize));
+        return;
+    }
     let val = target.0 as isize;
     let mut pushed = PUSHED_DOWN.lock().unwrap();
     pushed.retain(|&h| h != val);
@@ -886,7 +890,7 @@ fn fg_app_group(fg: HWND, all_hwnds: &[isize]) -> Vec<isize> {
         let state = &mut *(lparam.0 as *mut EnumState);
         let val = hwnd.0 as isize;
         if state.all_hwnds.contains(&val) { return BOOL(1); }
-        if !IsWindowVisible(hwnd).as_bool() { return BOOL(1); }
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() { return BOOL(1); }
         let mut cloaked: u32 = 0;
         let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut _, 4);
         if cloaked != 0 { return BOOL(1); }
@@ -973,15 +977,42 @@ fn app_process_group(
 /// on the same monitor stays blurred) or spanning all monitors when off.
 #[cfg(windows)]
 fn focused_group(anchor: HWND, all_hwnds: &[isize], monitor: isize) -> Vec<isize> {
-    if !APP_WIDE_FOCUS.load(Ordering::Relaxed) {
-        return fg_app_group(anchor, all_hwnds);
-    }
-    let scope = if OVERLAY_PER_MONITOR.load(Ordering::Relaxed) {
-        Some(monitor)
+    let group = if !APP_WIDE_FOCUS.load(Ordering::Relaxed) {
+        fg_app_group(anchor,all_hwnds)
     } else {
-        None
+        let scope = if OVERLAY_PER_MONITOR.load(Ordering::Relaxed) { Some(monitor) } else { None };
+        app_process_group(anchor,all_hwnds,scope)
     };
-    app_process_group(anchor, all_hwnds, scope)
+    // Explicit invariant: group[0] is the real anchor, not whichever popup
+    // EnumWindows returned first. Monitor transfer relies on this identity.
+    crate::focus_policy::anchor_first(anchor.0 as isize,group)
+}
+
+#[cfg(windows)]
+unsafe fn reconcile_focus(groups: &mut HashMap<isize,Vec<isize>>, hwnds: &[isize], ignored: &[isize], foreground: HWND) {
+    let ordered = enumerate_eligible_in_z_order(hwnds);
+    let windows: Vec<_> = ordered.iter().map(|&id| crate::focus_policy::Window {
+        id, monitor: MonitorFromWindow(HWND(id as *mut _),MONITOR_DEFAULTTONEAREST).0 as isize,
+    }).collect();
+    let previous: Vec<_> = groups.iter().filter_map(|(&monitor,group)| group.first().map(|&id|(monitor,id))).collect();
+    let anchors = crate::focus_policy::anchors(&previous,&windows,Some(foreground.0 as isize),OVERLAY_PER_MONITOR.load(Ordering::Relaxed));
+    let refreshed: HashMap<_,_> = anchors.into_iter().map(|(monitor,id)| (monitor,focused_group(HWND(id as *mut _),hwnds,monitor))).collect();
+    if *groups != refreshed { crate::logging::log("focus reconcile: lifecycle/group membership changed"); }
+    *groups = refreshed;
+    let sharp: Vec<_> = groups.values().flatten().copied().collect();
+    let root = HWND(hwnds[0] as *mut _);
+    // Reassert only actual violations, not the entire desktop every tracker tick.
+    for &id in &ordered {
+        let hwnd = HWND(id as *mut _);
+        let above = is_above_overlay(hwnd,root);
+        if crate::focus_policy::must_lower(id,&sharp,ignored,above) {
+            crate::logging::log(&format!("focus reconcile: lower unexpected sharp {id:#x}"));
+            push_below_overlay(hwnd,root);
+        } else if sharp.contains(&id) && !above {
+            let insert_after = if is_eligible_window(foreground,hwnds) && foreground != hwnd { foreground } else { HWND_TOP };
+            let _ = SetWindowPos(hwnd,Some(insert_after),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        }
+    }
 }
 
 /// Find the topmost eligible window underneath the overlay at a screen
@@ -1103,7 +1134,10 @@ unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
     // its alpha: alpha=0 lets clicks pass straight through. Hold a 1/255
     // floor while the overlay is visible so we always intercept clicks (the
     // GPU does the real colorize, so this alpha is imperceptible).
-    let catcher_alpha = if fade > 0.0 { 1 } else { 0 };
+    let mask = STATIC_MASK.load(Ordering::Relaxed);
+    let catcher_alpha = if fade <= 0.0 { 0 } else if mask {
+        (vis.tint_opacity * fade * 255.0).clamp(1.0,255.0) as u8
+    } else { 1 };
     SetLayeredWindowAttributes(
         tint_hwnd, windows::Win32::Foundation::COLORREF(0), catcher_alpha, LWA_ALPHA,
     ).ok();
@@ -1116,7 +1150,24 @@ unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
     // gets SetLayeredWindowAttributes — that would knock it out of ULW mode.
     let grain_strength = (vis.grain_amount * GRAIN_MAX_ALPHA * fade * 255.0)
         .clamp(0.0, 255.0) as u8;
-    update_grain_layer(grain_hwnd, grain_strength);
+    if mask {
+        let _ = ShowWindow(grain_hwnd, SW_HIDE);
+        let mut grain = GRAIN_DC.lock().unwrap();
+        if let Some(old) = grain.take() {
+            let old_dc = HDC(old as *mut _);
+            let bitmap = GetCurrentObject(old_dc, OBJ_BITMAP);
+            let _ = DeleteDC(old_dc);
+            let _ = DeleteObject(bitmap);
+        }
+    } else {
+        let missing = GRAIN_DC.lock().unwrap().is_none();
+        if missing {
+            if NOISE_DC.lock().unwrap().is_none() { create_noise_bitmap(); }
+            create_grain_surface(GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        }
+        update_grain_layer(grain_hwnd, grain_strength);
+        if fade > 0.0 { let _ = ShowWindow(grain_hwnd, SW_SHOWNOACTIVATE); }
+    }
 
     // --- Transparent z-order anchor ---
     // The old acrylic-blur path (SetWindowCompositionAttribute +
@@ -1152,7 +1203,6 @@ pub fn init() {
 
     std::thread::spawn(|| {
         unsafe {
-            create_noise_bitmap();
 
             let hinstance = GetModuleHandleW(None).unwrap();
             let class_name = windows::core::w!("DeepOverlay");
@@ -1170,12 +1220,10 @@ pub fn init() {
             let sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
 
-            // Bake the full-virtual-screen grain surface once (tiled from the
-            // noise pattern created above). The grain window is driven from it
-            // via UpdateLayeredWindow each fade tick.
-            create_grain_surface(sw, sh);
+            // Static mode allocates no noise/grain bitmap. Live blur creates it lazily.
 
             let mut hwnds = Vec::with_capacity(TOTAL_WINDOWS);
+            let mut capture_excluded = true;
             for i in 0..TOTAL_WINDOWS {
                 // Each window is owned by the previous one, creating a z-order chain.
                 // Windows guarantees: owned window is always above its owner.
@@ -1211,15 +1259,18 @@ pub fn init() {
                 // Exclude every overlay window from screen capture so the
                 // GPU blur's capture pipeline never ingests our own
                 // dim/grain/blur output — it must only ever see real apps.
-                let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+                let mut affinity = 0u32;
+                let excluded = SetWindowDisplayAffinity(hwnd,WDA_EXCLUDEFROMCAPTURE)
+                    .and_then(|_| GetWindowDisplayAffinity(hwnd,&mut affinity)).is_ok()
+                    && affinity == WDA_EXCLUDEFROMCAPTURE.0;
+                capture_excluded &= excluded;
+                crate::logging::log(&format!("overlay capture exclusion hwnd={:#x} verified={} affinity={affinity:#x}",hwnd.0 as isize,excluded));
                 hwnds.push(hwnd.0 as isize);
             }
 
-            let hwnds_snapshot = hwnds.clone();
             *ALL_HWNDS.lock().unwrap() = hwnds;
-            // Tell the magnifier which windows to exclude from its
-            // capture (otherwise it would capture our own paint).
-            crate::magnifier::set_filter_list(&hwnds_snapshot);
+            crate::gpu_blur::set_capture_allowed(capture_excluded);
+            if !capture_excluded { crate::logging::log("GPU blur disabled: overlay capture exclusion could not be verified"); }
             std::thread::spawn(foreground_tracker);
 
             let mut msg = MSG::default();
@@ -1241,6 +1292,7 @@ fn foreground_tracker() {
     // apps push the entire previous group down at once.
     let mut monitor_focused: HashMap<isize, Vec<isize>> = HashMap::new();
     let mut last_fg: isize = 0;
+    let mut last_reconcile = std::time::Instant::now();
 
     // Cached set of ignored-app windows. Resolving each window's exe is too
     // costly to do every tick, so refresh it on a slower cadence (and on any
@@ -1273,7 +1325,7 @@ fn foreground_tracker() {
                 let sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
                 let sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
                 if sw > 0 && sh > 0 {
-                    create_grain_surface(sw, sh);
+                    if !STATIC_MASK.load(Ordering::Relaxed) { create_grain_surface(sw, sh); }
                     for &value in &hwnds {
                         let _ = SetWindowPos(HWND(value as *mut _), None,
                             sx, sy, sw, sh, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1588,6 +1640,16 @@ fn foreground_tracker() {
 
             let fg = GetForegroundWindow();
             let fg_val = fg.0 as isize;
+            // Run before early returns. Closing/minimizing a window on another
+            // monitor and nonactivating self-raise do not change GetForegroundWindow.
+            // Defer a real new foreground to the immediate transition below.
+            if last_reconcile.elapsed().as_millis() >= 250
+                && (fg_val == last_fg || !is_eligible_window(fg,&hwnds))
+            {
+                reconcile_focus(&mut monitor_focused,&hwnds,&ignored,fg);
+                last_reconcile = std::time::Instant::now();
+            }
+
             if fg_val == 0 || is_overlay(fg_val) { continue; }
             if should_skip_window(fg) { continue; }
             // Our settings window is outside the focus engine: focusing it must
@@ -1729,7 +1791,7 @@ fn foreground_tracker() {
             }
 
             monitor_focused.retain(|_, v| {
-                v.retain(|h| IsWindow(Some(HWND(*h as *mut _))).as_bool());
+                v.retain(|h| { let hwnd=HWND(*h as *mut _); IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() });
                 !v.is_empty()
             });
 
@@ -1894,12 +1956,19 @@ unsafe extern "system" fn overlay_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
             let hwnds = ALL_HWNDS.lock().unwrap();
             let hwnd_val = hwnd.0 as isize;
 
-            // Grain [11] is painted via UpdateLayeredWindow, not WM_PAINT, so
+            // Grain is painted via UpdateLayeredWindow, not WM_PAINT, so
             // only the tint window draws here.
             if hwnds.get(TINT_IDX) == Some(&hwnd_val) {
-                // Tint [10]: solid color
+                // Cached GDI solid or hatch fill; no screen pixels are sampled.
                 let color = *OVERLAY_COLOR.lock().unwrap();
-                let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(color));
+                let pattern = MASK_PATTERN.load(Ordering::Relaxed);
+                let patterned = STATIC_MASK.load(Ordering::Relaxed) && pattern != 0;
+                let brush = if patterned {
+                    SetBkColor(hdc, windows::Win32::Foundation::COLORREF(color));
+                    SetBkMode(hdc, OPAQUE);
+                    CreateHatchBrush(if pattern == 2 { HS_CROSS } else { HS_BDIAGONAL },
+                        windows::Win32::Foundation::COLORREF(0))
+                } else { CreateSolidBrush(windows::Win32::Foundation::COLORREF(color)) };
                 FillRect(hdc, &ps.rcPaint, brush);
                 let _ = DeleteObject(brush.into());
             }
@@ -1915,6 +1984,10 @@ unsafe extern "system" fn overlay_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
 
 #[cfg(windows)]
 pub fn update_overlay(settings: &AppSettings, active: bool) {
+    let live = crate::renderer_policy::is_live(&settings.effect_renderer);
+    STATIC_MASK.store(!live, Ordering::Relaxed);
+    MASK_PATTERN.store(match settings.mask_pattern.as_str() { "stripes" => 1, "grid" => 2, _ => 0 }, Ordering::Relaxed);
+    crate::gpu_blur::set_renderer_enabled(live);
     let was_active = OVERLAY_ACTIVE.swap(active, Ordering::Relaxed);
     let prev_per_monitor = OVERLAY_PER_MONITOR.swap(settings.per_monitor_focus, Ordering::Relaxed);
     let prev_app_wide = APP_WIDE_FOCUS.swap(settings.app_wide_focus, Ordering::Relaxed);
@@ -2010,11 +2083,11 @@ pub fn update_overlay(settings: &AppSettings, active: bool) {
         }
 
         if was_active {
+            let (progress, target) = {
+                let fade = FADE.lock().unwrap();
+                (if fade.animating { fade.progress } else { 1.0 }, fade.target)
+            };
             let vis = VISUALS.lock().unwrap();
-            let fade = FADE.lock().unwrap();
-            let progress = if fade.animating { fade.progress } else { 1.0 };
-            let target = fade.target;
-            drop(fade);
             // apply_all re-pushes the grain surface via UpdateLayeredWindow;
             // only the tint window needs a WM_PAINT repaint (its solid color).
             apply_all(&hwnds, &vis, ease_for_target(progress, target));
@@ -2060,6 +2133,7 @@ pub fn update_overlay(settings: &AppSettings, active: bool) {
         let _ = SetWindowPos(root, insert_after, sx, sy, sw, sh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         // Show all owned windows (they position above root automatically)
         for &hwnd_val in &hwnds[1..] {
+            if !live && hwnd_val == hwnds[GRAIN_IDX] { continue; }
             let hwnd = HWND(hwnd_val as *mut _);
             let _ = SetWindowPos(hwnd, None, sx, sy, sw, sh, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
