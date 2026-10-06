@@ -10,8 +10,8 @@ we have not reproduced the user's exact styles/owner chains on their PC.
   passthrough heuristic only recognized app nonclient borders, not desktop icon
   controls. Empty/desktop hit areas could therefore swallow native gestures.
   Removed the input catcher and its hit-testing/polling/forced foreground calls.
-  All visual windows share disabled/nonactivating/transparent styles. Layered
-  windows use permanent WS_EX_TRANSPARENT. DComp windows are also WS_DISABLED;
+  All visual windows share layered/nonactivating/transparent styles. Layered
+  windows use permanent WS_EX_TRANSPARENT. DComp windows also use WS_EX_LAYERED | WS_EX_TRANSPARENT;
   HTTRANSPARENT is only a fallback, not assumed to route cross-thread input alone.
 - TOOLWINDOW was excluded by reconciliation but allowed by foreground handling.
   Now one classification function drives both. Background-effect eligibility is
@@ -55,7 +55,7 @@ mutation; global foreground replacement; previous minimize/restore, monitor tran
 mode/fade/capture policies; settings migration/roundtrip. The native Windows fixture
 creates its own normal window plus visual windows using the production style
 functions and verifies WindowFromPoint still returns the underlying fixture across
-show/hide and recreation. It does not send real mouse input, render WGC frames,
+show/hide and recreation, and binds/commits a DirectComposition target for the GPU-window style. The first WS_DISABLED candidate failed this fixture (38 pass / 1 fail) and was not released; production now uses the documented layered-window passthrough instead. It does not send real mouse input, render WGC frames,
 exercise Explorer's listview, or execute Firefox/Tablacus.
 
 Pending on a real Windows desktop (not performed on the user's PC):
@@ -72,6 +72,6 @@ Pending on a real Windows desktop (not performed on the user's PC):
 ## Platform references
 
 - [Layered-window hit testing](https://learn.microsoft.com/en-us/windows/win32/winmsg/window-features#layered-windows)
-- [EnableWindow / disabled windows](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enablewindow)
-- [WindowFromPoint skips disabled windows](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-windowfrompoint)
+- [DirectComposition permits layered target windows](https://learn.microsoft.com/en-us/windows/win32/api/dcomp/nf-dcomp-idcompositiondevice-createtargetforhwnd)
+- [WindowFromPoint reference](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-windowfrompoint)
 - [SetWindowPos / owner and topmost semantics](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos)

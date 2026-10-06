@@ -1155,7 +1155,7 @@ pub fn init() {
                 } else {
                     Some(HWND(hwnds[i - 1] as *mut _))
                 };
-                // All visual layers are permanently input-transparent and disabled.
+                // All visual layers are permanently layered and input-transparent.
                 let ex_style = crate::input_policy::visual_ex_style(true);
                 let hwnd = CreateWindowExW(
                     ex_style,

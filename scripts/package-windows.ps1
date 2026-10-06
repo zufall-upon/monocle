@@ -37,7 +37,7 @@ Compiled and packaged with the Tauri CLI on a standard GitHub-hosted Windows run
 Rust policy tests passed in this run; GPU/UI runtime was NOT exercised.
 Focus/input repair preview: new settings default to Live blur; explicit prior
 renderer choices (including Static) are preserved. Choose Live blur in settings.
-Visual HWNDs are disabled/nonactivating/input-transparent. First-click absorption
+Visual HWNDs are layered/nonactivating/input-transparent. First-click absorption
 is removed; native app/desktop actions pass through. Tool-window classification
 and hidden-owner grouping are repaired. Topmost windows remain outside the effect.
 The native WindowFromPoint fixture does not establish real desktop gesture behavior.

@@ -460,8 +460,8 @@ mod imp {
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
 
-        // Click-through, no activation, not in Alt+Tab, true per-pixel alpha
-        // (DComp). NOT topmost: the foreground app is raised above us.
+        // Layered+transparent supplies documented cross-thread input passthrough.
+        // NOREDIRECTIONBITMAP retains the DComp content path; alpha stays 255.
         let hwnd = CreateWindowExW(
             crate::input_policy::visual_ex_style(false),
             class_name,
@@ -478,12 +478,17 @@ mod imp {
         )
         .expect("gpu blur window creation failed");
 
+        if SetLayeredWindowAttributes(hwnd,windows::Win32::Foundation::COLORREF(0),255,LWA_ALPHA).is_err() {
+            log("gpu_blur layered input transparency initialization failed");
+            let _=DestroyWindow(hwnd);
+            return;
+        }
+
         // Exclude from screen capture: the pipeline must never feed our own
         // output back in.
         let set_ok = SetWindowDisplayAffinity(hwnd,WDA_EXCLUDEFROMCAPTURE).is_ok();
         let mut affinity = 0u32;
-        // Readback is documented for layered windows. This DComp HWND has
-        // NOREDIRECTIONBITMAP, not LAYERED; failed readback is not Set failure.
+        // Get is diagnostic; reject a successful readback that contradicts Set.
         let readback = GetWindowDisplayAffinity(hwnd,&mut affinity).is_ok();
         let excluded = set_ok && (!readback || affinity == WDA_EXCLUDEFROMCAPTURE.0);
         log(&format!("capture exclusion hwnd={:#x} set_ok={} readback={} affinity={affinity:#x} allowed={}",hwnd.0 as isize,set_ok,readback,excluded));
