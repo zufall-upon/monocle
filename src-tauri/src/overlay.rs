@@ -632,9 +632,8 @@ fn ignored_hwnds(ignored: Vec<String>) -> Vec<isize> {
 unsafe fn push_below_overlay(target: HWND, root_overlay: HWND) {
     // Ignored apps are always sharp — never demote them, no matter which path
     // (focus change, monitor transfer) asked to.
-    if is_ignored_hwnd(target.0 as isize) || !is_effect_target(target) {
-        return;
-    }
+    if is_ignored_hwnd(target.0 as isize) { crate::placement_trace::skipped(true); return; }
+    if !is_effect_target(target) { crate::placement_trace::skipped(false); return; }
     if crate::placement_trace::lower(target,root_overlay,"focus-demotion").is_err() { return; }
     let val = target.0 as isize;
     let mut pushed = PUSHED_DOWN.lock().unwrap();

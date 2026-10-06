@@ -15,10 +15,10 @@ impl Budget {
 }
 struct Pending { id:isize, root:isize, pid:u32, tid:u32, at:u64, text:String }
 struct Trace { start:Instant, budget:Budget, attempts:u64, errors:u64, sampled:u64,
-    pending:Vec<Pending>, records:VecDeque<String>, disk_lines:u32 }
+    skipped_ignored:u64, skipped_ineligible:u64, pending:Vec<Pending>, records:VecDeque<String>, disk_lines:u32 }
 impl Trace {
     fn new()->Self { Self { start:Instant::now(),budget:Budget::default(),attempts:0,errors:0,sampled:0,
-        pending:Vec::new(),records:VecDeque::new(),disk_lines:0 } }
+        skipped_ignored:0,skipped_ineligible:0,pending:Vec::new(),records:VecDeque::new(),disk_lines:0 } }
 }
 static TRACE:LazyLock<Mutex<Trace>>=LazyLock::new(||Mutex::new(Trace::new()));
 
@@ -67,7 +67,7 @@ pub unsafe fn lower(target:HWND,root:HWND,source:&str)->windows::core::Result<()
 pub unsafe fn lower_after(target:HWND,after_window:HWND,root:HWND,source:&str)->windows::core::Result<()> {
     let sample={ let mut trace=TRACE.lock().unwrap(); trace.attempts+=1;
         let now=trace.start.elapsed().as_millis() as u64;
-        if trace.budget.admit(target.0 as isize,now) { trace.sampled+=1; Some((trace.sampled,now)) } else { None } };
+        if trace.pending.len()<4 && trace.budget.admit(target.0 as isize,now) { trace.sampled+=1; Some((trace.sampled,now)) } else { None } };
     let (pid,tid)=if sample.is_some(){identity(target)}else{(0,0)};
     let security_info=sample.map(|_|format!("target_security=[{}] self_security=[{}]",security(pid),security(std::process::id())));
     let before=sample.map(|_|position(target,root));
@@ -102,10 +102,15 @@ pub unsafe fn observe_next() {
     }
 }
 
+pub fn skipped(ignored:bool) {
+    let mut trace=TRACE.lock().unwrap();
+    if ignored {trace.skipped_ignored+=1;} else {trace.skipped_ineligible+=1;}
+}
+
 pub fn report()->String {
     let trace=TRACE.lock().unwrap();
-    format!("placement_diagnostic=1 attempts={} api_errors={} sampled={} pending={} disk_lines={}/120 sampling=4_per_second_global,1_per_2_seconds_per_hwnd records=last_16\n{}\n",
-        trace.attempts,trace.errors,trace.sampled,trace.pending.len(),trace.disk_lines,
+    format!("placement_diagnostic=1 attempts={} api_errors={} skipped_ignored={} skipped_ineligible={} sampled={} pending={} disk_lines={}/120 sampling=4_per_second_global,1_per_2_seconds_per_hwnd records=last_16\n{}\n",
+        trace.attempts,trace.errors,trace.skipped_ignored,trace.skipped_ineligible,trace.sampled,trace.pending.len(),trace.disk_lines,
         trace.records.iter().cloned().collect::<Vec<_>>().join("\n"))
 }
 

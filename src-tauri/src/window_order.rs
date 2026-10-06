@@ -42,13 +42,14 @@ mod tests {
             let (tx,rx)=std::sync::mpsc::channel();
             let worker=std::thread::spawn(move|| {
                 let h=create(); SetWindowLongPtrW(h,GWLP_USERDATA,1);
+                let rebound=create(); let _=ShowWindow(rebound,SW_SHOWNOACTIVATE);
                 let _=ShowWindow(h,SW_SHOWNOACTIVATE);
-                tx.send((h.0 as isize,GetCurrentThreadId())).unwrap();
+                tx.send((h.0 as isize,rebound.0 as isize,GetCurrentThreadId())).unwrap();
                 let mut msg=MSG::default();
                 while GetMessageW(&mut msg,None,0,0).0>0 {let _=TranslateMessage(&msg);DispatchMessageW(&msg);}
-                let _=DestroyWindow(h);
+                let _=DestroyWindow(rebound); let _=DestroyWindow(h);
             });
-            let (id,tid)=rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            let (id,rebound_id,tid)=rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
             let target=HWND(id as *mut _);
             assert_ne!(tid,GetCurrentThreadId());
             // Move divider instead; the target intentionally refuses z-order moves.
@@ -62,12 +63,22 @@ mod tests {
             SetWindowLongPtrW(target,GWLP_USERDATA,0);
             let accepted=lower_window(target,root);
             let moved=above(target,root);
+            let rebound=HWND(rebound_id as *mut _);
+            let rebound_result=crate::placement_trace::lower(rebound,root,"fixture-later-raise");
+            let rebound_after=above(rebound,root);
+            SetWindowPos(rebound,Some(HWND_TOP),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE).unwrap();
+            crate::placement_trace::observe_next();
+            let rebound_report=crate::placement_trace::report();
             let _=PostThreadMessageW(tid,WM_QUIT,WPARAM(0),LPARAM(0));
             worker.join().unwrap(); let _=DestroyWindow(root);
             assert_eq!(initial,Some(true)); assert!(result.is_ok()); assert_eq!(unchanged,Some(true));
             assert!(report.contains("fixture-reject-zorder") && report.contains("result=ok"));
             assert!(report.contains("next_after_ms=") && report.contains("target_security=[integrity_rid="));
             assert!(accepted.is_ok()); assert_eq!(moved,Some(false));
+            assert!(rebound_result.is_ok()); assert_eq!(rebound_after,Some(false));
+            let line=rebound_report.lines().find(|line|line.contains("fixture-later-raise")).unwrap();
+            assert!(line.split(" after=[").nth(1).unwrap().split(" next_after_ms=").next().unwrap().contains("above_root=Some(false)"));
+            assert!(line.split(" next=[").nth(1).unwrap().contains("above_root=Some(true)"));
             println!("cross-thread veto: SetWindowPos=Ok, position unchanged; accepting same call moves below divider");
         }
     }
