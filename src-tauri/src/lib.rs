@@ -1,5 +1,9 @@
 #[cfg(windows)]
 mod input_policy;
+#[cfg(windows)]
+mod window_order;
+#[cfg(windows)]
+mod placement_trace;
 #[cfg(all(windows, test))]
 mod z_order_fixture;
 mod renderer_policy;

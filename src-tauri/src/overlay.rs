@@ -635,13 +635,7 @@ unsafe fn push_below_overlay(target: HWND, root_overlay: HWND) {
     if is_ignored_hwnd(target.0 as isize) || !is_effect_target(target) {
         return;
     }
-    if let Err(error) = SetWindowPos(
-        target, Some(root_overlay), 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-    ) {
-        crate::logging::log(&format!("focus demotion failed hwnd={:#x}: {error:?}",target.0 as isize));
-        return;
-    }
+    if crate::placement_trace::lower(target,root_overlay,"focus-demotion").is_err() { return; }
     let val = target.0 as isize;
     let mut pushed = PUSHED_DOWN.lock().unwrap();
     pushed.retain(|&h| h != val);
@@ -836,6 +830,7 @@ fn focus_diagnostics() -> String {
         let mut out=format!("per_monitor={} app_wide={} static={} foreground={:#x} root={root:#x}\n",
             OVERLAY_PER_MONITOR.load(Ordering::Relaxed),APP_WIDE_FOCUS.load(Ordering::Relaxed),
             STATIC_MASK.load(Ordering::Relaxed),GetForegroundWindow().0 as isize);
+        out.push_str(&crate::placement_trace::report());
         let trace=FOCUS_TRACE.lock().unwrap().clone();
         let ignored=IGNORED_CONFIG.lock().unwrap().clone();
         out.push_str(&format!("last_real_foreground={:#x} tracked_foreground={:#x} retained_anchors={:x?} retained_sharp={:x?}\nignored_source=settings.ignored_apps ignored_revision={} normalized_ignored_exes={:?}\n",
@@ -875,13 +870,8 @@ pub fn diagnostic_snapshot() -> String { "Windows-only diagnostics".into() }
 /// Short window label for the diagnostic log: `0x1234 "Title" [exe]`.
 #[cfg(windows)]
 fn win_label(hwnd_val: isize) -> String {
-    let title = unsafe {
-        let mut buf = [0u16; 96];
-        let len = GetWindowTextW(HWND(hwnd_val as *mut _), &mut buf);
-        String::from_utf16_lossy(&buf[..len.max(0) as usize])
-    };
     let exe = crate::windows_api::exe_name_for_hwnd(hwnd_val).unwrap_or_default();
-    format!("{:#x} \"{}\" [{}]", hwnd_val, title, exe)
+    format!("{:#x} [{}]", hwnd_val, exe)
 }
 
 /// True if `w` sits above `root_overlay` in global z-order (i.e. it's sharp,
@@ -1039,7 +1029,6 @@ unsafe fn reconcile_focus(groups: &mut HashMap<isize,Vec<isize>>, hwnds: &[isize
         let hwnd = HWND(id as *mut _);
         let above = is_above_overlay(hwnd,root);
         if crate::focus_policy::must_lower(id,&sharp,ignored,above) {
-            crate::logging::log(&format!("focus reconcile: lower unexpected sharp {id:#x}"));
             push_below_overlay(hwnd,root);
         } else if sharp.contains(&id) && !above {
             let insert_after = if is_eligible_window(foreground,hwnds) && foreground != hwnd { foreground } else { HWND_TOP };
@@ -1259,6 +1248,7 @@ fn foreground_tracker() {
         if hwnds.is_empty() { continue; }
 
         unsafe {
+            crate::placement_trace::observe_next();
             if DISPLAY_DIRTY.swap(false, Ordering::AcqRel) {
                 let sw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
                 let sh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -1541,10 +1531,7 @@ fn foreground_tracker() {
                     for w in enumerate_effect_targets(&hwnds) {
                         if sharp_set.contains(&w) { continue; }
                         let hw = HWND(w as *mut _);
-                        let _ = SetWindowPos(
-                            hw, Some(prev_below), 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                        );
+                        if crate::placement_trace::lower_after(hw,prev_below,root_overlay,"setup-demotion").is_err() { continue; }
                         prev_below = hw;
                         pushed.retain(|&h| h != w);
                         pushed.push(w);

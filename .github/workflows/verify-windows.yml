@@ -45,6 +45,8 @@ jobs:
           if ($rendererTests.Count -lt 4) { throw "Expected at least 4 renderer lifecycle tests." }
           $inputTests = @($allTests | Select-String '^input_policy::tests::.+: test$')
           if ($inputTests.Count -lt 1) { throw "Expected Win32 visual input fixture." }
+          $placementTests = @($allTests | Select-String '^(window_order::tests|placement_trace::tests|z_order_fixture)::.+: test$')
+          if ($placementTests.Count -lt 3) { throw "Expected native placement/owner and sampling regression tests." }
           cargo test --locked --lib -- --test-threads=1 --nocapture
       - name: Build Windows executable and NSIS installer
         if: github.ref_name != 'investigate-z-order'

@@ -15,6 +15,7 @@ unsafe fn place(h: HWND, after: HWND) {
 unsafe fn app_place(h: HWND, after: HWND, lowering: bool) {
     let bit=if lowering {1} else {2};
     let preserve=OWNER_MODE.load(std::sync::atomic::Ordering::Relaxed)&bit!=0;
+    if lowering && preserve { crate::window_order::lower_window(h,after).unwrap(); return; }
     let flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE;
     let flags=if preserve {flags|SWP_NOOWNERZORDER} else {flags};
     SetWindowPos(h,Some(after),0,0,0,0,flags).unwrap();
