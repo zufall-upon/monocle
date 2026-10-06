@@ -15,7 +15,7 @@ The first preview (`a6846a5`) was reported still too heavy by the user. Its succ
 | Disabled | Capture stopped, intermediate images retained | Capture stopped and working caches released after fade |
 | Retired overlay anchors | 10 transparent full-desktop windows | 1 transparent z-order anchor |
 
-Effect cache identity contains captured-frame generation, sigma, desaturation and tint. Fade and mode mix are not part of that identity. Deep uses the highest level shared with Ambient; entering Ambient adds only missing lower levels and its sharp base. Ambient with zero sigma has no Gaussian passes. Identical settings do not change the effect cache.
+Effect cache identity contains captured-frame generation, sigma, desaturation and tint. Fade and mode mix are not part of that identity. Tint/desaturation is materialized once into a bounded working bitmap before Gaussian, preserving HARD screen-edge clamping and sharing the color pass across levels. Deep uses the highest level shared with Ambient; entering Ambient adds only missing lower levels and its sharp base. Ambient with zero sigma has no Gaussian passes. Identical settings do not change the effect cache.
 
 WGC still captures at native monitor resolution. This is not a claim of smaller WGC capture or guaranteed removal of cross-adapter traffic. Direct2D's own Gaussian optimization may already pre-scale. Final swapchain/composition is native resolution. Capture consumption still has a 50 ms upper-rate budget; this is not the principal revision-2 change.
 
@@ -42,10 +42,10 @@ If a driver cannot wrap the WGC surface as a D2D bitmap, a lazy owned native tex
 - `copy_resource`: compatibility full-texture copies (normally zero on the direct path).
 - `downsample`: owned working-input draws (native on weak/odd fallback).
 - `native_ingest`: native Ambient/zero-blur input-cache copies.
-- `sharp`: native sharp effect evaluations; `blur`: Gaussian bitmap evaluations.
+- `color`: working-resolution color materialization; `sharp`: native sharp effect evaluations; `blur`: Gaussian bitmap evaluations.
 - `present`: swapchain calls; `starts`/`stops` and `session`: capture lifecycle.
 
-Take differences between two log lines for the same monitor and worker, dividing by elapsed milliseconds. These are CPU-side submitted operation counts, **not GPU duration/utilization measurements**. New workers reset counters. Logs contain geometry/adapter names but no captured pixels or application content.
+Take differences between two log lines for the same monitor and worker, dividing by elapsed milliseconds. These are CPU-side submitted operation counts, **not GPU duration/utilization measurements**. New workers reset counters. The timestamped diagnostic log rotates at 1 MiB with one `.old` file; rotation is serialized across workers. Logs contain geometry/adapter names but no captured pixels or application content.
 
 For an authorized test, record only: preview SHA, mode/blur/tint settings, each display's resolution/scaling and logged adapter; 30 seconds disabled, 30 seconds static enabled, and 30 seconds of the same moving content in Deep then Ambient. Pair log deltas with Task Manager's per-process GPU/GPU-engine columns for Deep Lite and Desktop Window Manager. Do not attribute whole-adapter GPU percentages solely to this app. No user-machine measurement or executable launch is performed by CI.
 

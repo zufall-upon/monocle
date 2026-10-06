@@ -679,13 +679,14 @@ mod imp {
     struct Perf {
         started: std::time::Instant, last: std::time::Instant,
         acquired: u64, skipped: u64, downsample: u64, sharp: u64,
-        blur: u64, present: u64, starts: u64, stops: u64, copies: u64, native_ingest: u64,
+        blur: u64, present: u64, starts: u64, stops: u64, copies: u64, native_ingest: u64, color: u64,
     }
     impl Perf {
-        fn new() -> Self { Self { started: std::time::Instant::now(), last: std::time::Instant::now(), acquired: 0, skipped: 0, downsample: 0, sharp: 0, blur: 0, present: 0, starts: 0, stops: 0, copies: 0, native_ingest: 0 } }
+        fn new() -> Self { Self { started: std::time::Instant::now(), last: std::time::Instant::now(), acquired: 0, skipped: 0, downsample: 0, sharp: 0, blur: 0, present: 0, starts: 0, stops: 0, copies: 0, native_ingest: 0, color: 0 } }
     }
     struct EffectSurfaces {
         extent: Extent, input: ID2D1Bitmap1, input_frame: Option<u64>,
+        tinted: Option<ID2D1Bitmap1>, tint_key: Option<EffectKey>,
         bands: [Option<ID2D1Bitmap1>; 3], sharp: Option<ID2D1Bitmap1>, raw_sharp: Option<ID2D1Bitmap1>, raw_frame: Option<u64>, validity: EffectValidity,
     }
 
@@ -693,7 +694,7 @@ mod imp {
         {
             let mut p = rs.perf.borrow_mut();
             if p.last.elapsed().as_secs() >= 10 {
-                log(&format!("perf monitor={},{} elapsed_ms={} capture={} skipped={} copy_resource={} downsample={} native_ingest={} sharp={} blur={} present={} starts={} stops={} session={}", rs.origin_x, rs.origin_y, p.started.elapsed().as_millis(), p.acquired, p.skipped, p.copies, p.downsample, p.native_ingest, p.sharp, p.blur, p.present, p.starts, p.stops, rs.session.borrow().is_some()));
+                log(&format!("perf monitor={},{} elapsed_ms={} capture={} skipped={} copy_resource={} downsample={} native_ingest={} color={} sharp={} blur={} present={} starts={} stops={} session={}", rs.origin_x, rs.origin_y, p.started.elapsed().as_millis(), p.acquired, p.skipped, p.copies, p.downsample, p.native_ingest, p.color, p.sharp, p.blur, p.present, p.starts, p.stops, rs.session.borrow().is_some()));
                 p.last = std::time::Instant::now();
             }
         }
@@ -829,7 +830,7 @@ mod imp {
         let mut cache = rs.effects.borrow_mut();
         if cache.as_ref().map(|c| c.extent != plan.extent).unwrap_or(true) {
             log(&format!("processing monitor={},{} extent={}x{} divisor={}",rs.origin_x,rs.origin_y,plan.extent.width,plan.extent.height,plan.divisor));
-            *cache = Some(EffectSurfaces { extent: plan.extent, input: effect_bitmap(&rs.ctx, plan.extent)?, input_frame: None, bands: [None,None,None], sharp: None, raw_sharp: None, raw_frame: None, validity: EffectValidity::default() });
+            *cache = Some(EffectSurfaces { extent: plan.extent, input: effect_bitmap(&rs.ctx, plan.extent)?, input_frame: None, tinted: None, tint_key: None, bands: [None,None,None], sharp: None, raw_sharp: None, raw_frame: None, validity: EffectValidity::default() });
         }
         let c = cache.as_mut().unwrap(); c.validity.update(key);
         let needed = required_bands(mix, sigma);
@@ -885,10 +886,28 @@ mod imp {
             paint_effect(rs, c.raw_sharp.as_ref().unwrap(), c.sharp.as_ref().unwrap(), key, None, Extent { width:rs.width,height:rs.height })?;
             rs.perf.borrow_mut().sharp += 1; c.validity.sharp_done();
         }
+        if needed.iter().any(|&v|v) && c.tint_key != Some(key) {
+            if c.tinted.is_none() { c.tinted = Some(effect_bitmap(&rs.ctx,plan.extent)?); }
+            // Materialize finite bounds before Gaussian: Flood's infinite
+            // extent must not replace HARD edge clamping with colored padding.
+            paint_effect(rs,&c.input,c.tinted.as_ref().unwrap(),key,None,plan.extent)?;
+            rs.perf.borrow_mut().color += 1;
+            c.tint_key = Some(key);
+        }
         for index in 0..3 {
             if needed[index] && c.validity.needs_band(index) {
                 if c.bands[index].is_none() { c.bands[index] = Some(effect_bitmap(&rs.ctx,plan.extent)?); }
-                paint_effect(rs, &c.input, c.bands[index].as_ref().unwrap(), key, Some(plan.stddev * (index+1) as f32 / 3.0), plan.extent)?;
+                let result = (|| -> windows::core::Result<()> {
+                    rs.gaussian.SetInput(0,c.tinted.as_ref().unwrap(),true);
+                    set_blur(&rs.gaussian,plan.stddev * (index+1) as f32 / 3.0);
+                    let output = rs.gaussian.GetOutput()?;
+                    rs.ctx.SetTarget(c.bands[index].as_ref().unwrap()); rs.ctx.BeginDraw();
+                    rs.ctx.Clear(Some(&transparent()));
+                    rs.ctx.DrawImage(&output,None,Some(&rect(plan.extent.width,plan.extent.height)),D2D1_INTERPOLATION_MODE_LINEAR,D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                    rs.ctx.EndDraw(None,None)
+                })();
+                rs.gaussian.SetInput(0,None::<&ID2D1Image>,true);
+                result?;
                 rs.perf.borrow_mut().blur += 1; c.validity.band_done(index);
             }
         }
@@ -1061,12 +1080,17 @@ mod imp {
 
     fn log(s: &str) {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(std::env::temp_dir().join("deep-lite-gpu-blur.log"))
-        {
-            let _ = writeln!(f, "{s}");
+        static LOG_WRITE: Mutex<()> = Mutex::new(());
+        let Ok(_guard) = LOG_WRITE.lock() else { return; };
+        let path = std::env::temp_dir().join("deep-lite-gpu-blur.log");
+        if std::fs::metadata(&path).map(|m| m.len() >= 1_048_576).unwrap_or(false) {
+            let old = path.with_extension("log.old");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(&path,&old);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            let _ = writeln!(f, "{now} {s}");
         }
     }
 }
