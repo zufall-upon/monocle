@@ -1,0 +1,28 @@
+name: Verify Windows source
+
+# Explicit dispatch only: no installer publication and no automatic build on push.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show preinstalled toolchain
+        run: |
+          rustc --version
+          cargo --version
+      - name: Check Windows code
+        working-directory: src-tauri
+        run: cargo check --locked
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked --lib
+      - name: Build Windows executable without installer
+        working-directory: src-tauri
+        run: cargo build --locked --release

@@ -104,8 +104,7 @@ mod imp {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use windows::core::{factory, w, IInspectable, Interface};
-    use windows::Foundation::TypedEventHandler;
+    use windows::core::{factory, w, Interface};
     use windows::Graphics::Capture::{
         Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
     };
@@ -158,13 +157,12 @@ mod imp {
     use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    // "A new capture frame is ready" — posted from the capture pool thread.
-    const WM_FRAME: u32 = WM_APP + 1;
-    // "Overlay state changed (fade / params / active)" — posted from the
-    // overlay threads via sync(). WGC only fires on screen *change*, so a
-    // static desktop wouldn't otherwise redraw when the user scrubs the
-    // slider or the fade advances. This forces a redraw.
-    const WM_GPU_SYNC: u32 = WM_APP + 2;
+    // Polling consumes at most one newest frame per tick. This caps application
+    // copy/effects/Present work; it does NOT lower WGC's capture resolution or
+    // promise to cap the compositor's internal capture work.
+    const RENDER_TIMER: usize = 1;
+    const FRAME_INTERVAL_MS: u32 = 50; // background blur: at most 20 updates/s
+    static REVISION: AtomicU64 = AtomicU64::new(1);
 
     // Ambient (progressive) blur stacks this many discrete blur bands, each
     // masked by its own vertical gradient, to approximate a continuous
@@ -221,13 +219,13 @@ mod imp {
     }
 
     pub fn set_mode_mix(mix: f64) {
-        MODE_MIX_BITS.store(mix.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-        sync();
+        if MODE_MIX_BITS.swap(mix.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed)
+            != mix.clamp(0.0, 1.0).to_bits() { sync(); }
     }
 
     pub fn set_fade(progress: f64) {
-        FADE_BITS.store(progress.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-        sync();
+        if FADE_BITS.swap(progress.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed)
+            != progress.clamp(0.0, 1.0).to_bits() { sync(); }
     }
 
     pub fn set_tint(r: f32, g: f32, b: f32, strength: f32) {
@@ -254,12 +252,7 @@ mod imp {
     }
 
     fn sync() {
-        let windows = WINDOWS.lock().unwrap();
-        for &w in windows.iter() {
-            unsafe {
-                let _ = PostMessageW(Some(HWND(w as *mut _)), WM_GPU_SYNC, WPARAM(0), LPARAM(0));
-            }
-        }
+        REVISION.fetch_add(1, Ordering::Release);
     }
 
     pub fn reassert_z(insert_after: isize) {
@@ -283,20 +276,41 @@ mod imp {
     }
 
     pub fn init() {
-        // Enumerate monitors on the calling thread, then spawn one capture
-        // thread per monitor. HMONITOR is just a handle; pass it as isize.
-        let mut monitors: Vec<(isize, windows::Win32::Foundation::RECT)> = Vec::new();
-        unsafe {
-            let _ = EnumDisplayMonitors(
-                None,
-                None,
-                Some(monitor_enum),
-                LPARAM(&mut monitors as *mut _ as isize),
-            );
-        }
-        for (hmon, rect) in monitors {
-            std::thread::spawn(move || unsafe { run_thread(hmon, rect) });
-        }
+        // Reconcile monitor handles AND geometry. Recreate resources on resize,
+        // rotation, reconnect and resume instead of copying mismatched textures.
+        std::thread::spawn(|| {
+            let mut workers: Vec<(isize, windows::Win32::Foundation::RECT,
+                Arc<AtomicBool>, std::thread::JoinHandle<()>)> = Vec::new();
+            loop {
+                let mut monitors: Vec<(isize, windows::Win32::Foundation::RECT)> = Vec::new();
+                unsafe {
+                    let _ = EnumDisplayMonitors(None, None, Some(monitor_enum),
+                        LPARAM(&mut monitors as *mut _ as isize));
+                }
+                let mut i = 0;
+                while i < workers.len() {
+                    let (handle, rect, _, thread) = &workers[i];
+                    if thread.is_finished() || !monitors.iter().any(|(h, r)| h == handle && r == rect) {
+                        let (_, _, stop, thread) = workers.remove(i);
+                        stop.store(true, Ordering::Release);
+                        let _ = thread.join();
+                    } else {
+                        i += 1;
+                    }
+                }
+                for (hmon, rect) in monitors {
+                    if !workers.iter().any(|(h, _, _, _)| *h == hmon) {
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let worker_stop = stop.clone();
+                        let thread = std::thread::spawn(move || unsafe {
+                            run_thread(hmon, rect, worker_stop)
+                        });
+                        workers.push((hmon, rect, stop, thread));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
     }
 
     unsafe extern "system" fn monitor_enum(
@@ -342,9 +356,9 @@ mod imp {
         origin_x: i32,
         origin_y: i32,
         has_frame: Cell<bool>,
-        frame_pending: Arc<AtomicBool>,
-        frame_token: i64,
-        _session: GraphicsCaptureSession,
+        item: GraphicsCaptureItem,
+        session: RefCell<Option<GraphicsCaptureSession>>,
+        revision: Cell<u64>,
         _d3d: ID3D11Device,
         _d3d_device: IDirect3DDevice,
         _target: IDCompositionTarget,
@@ -354,11 +368,22 @@ mod imp {
         shown: Cell<bool>,
     }
 
+    impl Drop for Render {
+        fn drop(&mut self) {
+            if let Some(session) = self.session.get_mut().take() {
+                let _ = session.Close();
+            }
+            let _ = self.framepool.Close();
+        }
+    }
+
     thread_local! {
+        static STOP: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
         static RENDER: RefCell<Option<Render>> = const { RefCell::new(None) };
     }
 
-    unsafe fn run_thread(hmon: isize, rect: windows::Win32::Foundation::RECT) {
+    unsafe fn run_thread(hmon: isize, rect: windows::Win32::Foundation::RECT, stop: Arc<AtomicBool>) {
+        STOP.with(|s| *s.borrow_mut() = Some(stop));
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
 
         let hinstance = GetModuleHandleW(None).unwrap();
@@ -408,9 +433,20 @@ mod imp {
 
         if let Err(e) = init_render(hwnd, hmon, x, y, w as u32, h as u32) {
             log(&format!("gpu_blur init_render failed: {e:?}"));
+            let _ = DestroyWindow(hwnd);
+            WINDOWS.lock().unwrap().retain(|&h| h != hwnd.0 as isize);
+            return;
         }
 
-        // Created hidden; sync() shows it once the overlay activates.
+        // The timer also services shutdown while capture is suspended.
+        if SetTimer(Some(hwnd), RENDER_TIMER, FRAME_INTERVAL_MS, None) == 0 {
+            log("gpu_blur timer creation failed");
+            let _ = DestroyWindow(hwnd);
+            RENDER.with(|r| *r.borrow_mut() = None);
+            WINDOWS.lock().unwrap().retain(|&h| h != hwnd.0 as isize);
+            return;
+        }
+        // Created hidden; the first tick applies the latest shared state.
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -578,31 +614,6 @@ mod imp {
             2,
             size,
         )?;
-        let session = framepool.CreateCaptureSession(&item)?;
-        let _ = session.SetIsCursorCaptureEnabled(false);
-        let _ = session.SetIsBorderRequired(false);
-
-        let frame_pending = Arc::new(AtomicBool::new(false));
-        let fp = frame_pending.clone();
-        let hwnd_isize = hwnd.0 as isize;
-        let handler = TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
-            move |_pool, _args| {
-                if !fp.swap(true, Ordering::AcqRel) {
-                    unsafe {
-                        let _ = PostMessageW(
-                            Some(HWND(hwnd_isize as *mut _)),
-                            WM_FRAME,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
-                }
-                Ok(())
-            },
-        );
-        let frame_token = framepool.FrameArrived(&handler)?;
-        session.StartCapture()?;
-
         // Owned texture we CopyResource each frame into (frame-pool textures
         // recycle after Close()), wrapped as a D2D bitmap for the chain.
         let cap_desc = D3D11_TEXTURE2D_DESC {
@@ -656,9 +667,9 @@ mod imp {
                 origin_x,
                 origin_y,
                 has_frame: Cell::new(false),
-                frame_pending,
-                frame_token,
-                _session: session,
+                item,
+                session: RefCell::new(None),
+                revision: Cell::new(0),
                 _d3d: d3d,
                 _d3d_device: d3d_device,
                 _target: target,
@@ -671,46 +682,98 @@ mod imp {
         Ok(())
     }
 
-    fn render() {
+    fn render(hwnd: HWND) {
         RENDER.with(|r| {
             if let Some(rs) = r.borrow().as_ref() {
-                if let Err(e) = unsafe { draw(rs) } {
+                if let Err(e) = unsafe { draw(hwnd, rs) } {
                     log(&format!("gpu_blur draw failed: {e:?}"));
+                    // Reconciliation retries with fresh capture/device resources.
+                    unsafe { let _ = DestroyWindow(hwnd); }
                 }
             }
         });
     }
 
-    unsafe fn draw(rs: &Render) -> windows::core::Result<()> {
+    unsafe fn draw(hwnd: HWND, rs: &Render) -> windows::core::Result<()> {
         let ctx = &rs.ctx;
-
-        // Fully idle: overlay off and faded out. WGC keeps firing FrameArrived
-        // on every screen change regardless of our state, so without this we'd
-        // run a full-screen GPU copy + present per monitor on each change even
-        // while Deep is disabled. Drain & discard the frames cheaply and
-        // bail before any real work.
-        if !ACTIVE.load(Ordering::Relaxed) && fade() <= 0.0 {
-            while let Ok(frame) = rs.framepool.TryGetNextFrame() {
-                let _ = frame.Close();
+        let revision = REVISION.load(Ordering::Acquire);
+        let dirty = revision != rs.revision.get();
+        if !wants_capture() {
+            sync_visibility(hwnd, rs);
+            if let Some(session) = rs.session.borrow_mut().take() {
+                session.Close()?;
+                while let Ok(frame) = rs.framepool.TryGetNextFrame() {
+                    let _ = frame.Close();
+                }
+                rs.has_frame.set(false);
             }
+            rs.revision.set(revision);
             return Ok(());
         }
 
-        // Drain the capture pool to the freshest frame.
-        let mut got = false;
-        while let Ok(frame) = rs.framepool.TryGetNextFrame() {
-            if let Ok(surface) = frame.Surface() {
-                if let Ok(access) = surface.cast::<IDirect3DDxgiInterfaceAccess>() {
-                    if let Ok(src_tex) = access.GetInterface::<ID3D11Texture2D>() {
-                        rs.d3d_ctx.CopyResource(&rs.cap_tex, &src_tex);
-                        got = true;
+        if rs.session.borrow().is_none() {
+            let session = rs.framepool.CreateCaptureSession(&rs.item)?;
+            let _ = session.SetIsCursorCaptureEnabled(false);
+            let _ = session.SetIsBorderRequired(false);
+            // Optional on newer Windows. Older systems return E_NOINTERFACE;
+            // our consumer-side budget still applies there.
+            let _ = session.SetMinUpdateInterval(windows::Foundation::TimeSpan {
+                Duration: i64::from(FRAME_INTERVAL_MS) * 10_000,
+            });
+            session.StartCapture()?;
+            *rs.session.borrow_mut() = Some(session);
+        }
+
+        // Retain only the freshest queued frame, closing older frames before
+        // touching the GPU. Bound the drain to the pool size so a producer
+        // cannot starve the UI thread by supplying frames continuously.
+        let mut newest = None;
+        for _ in 0..2 {
+            match rs.framepool.TryGetNextFrame() {
+                Ok(frame) => {
+                    if let Some(old) = newest.replace(frame) {
+                        let _ = old.Close();
                     }
                 }
+                // windows-rs maps a successful null frame (empty pool) to
+                // Error::empty(). Other errors must trigger resource recovery.
+                Err(e) if e.code() == windows::core::Error::empty().code() => break,
+                Err(e) => {
+                    if let Some(frame) = newest { let _ = frame.Close(); }
+                    return Err(e);
+                }
             }
+        }
+        let mut got = false;
+        if let Some(frame) = newest {
+            // Always release the checked-out frame, including on COM failures.
+            let result = (|| -> windows::core::Result<bool> {
+                let size = frame.ContentSize()?;
+                if size.Width != rs.width as i32 || size.Height != rs.height as i32 {
+                    return Ok(false); // topology reconciliation will rebuild
+                }
+                let surface = frame.Surface()?;
+                let access = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
+                let src_tex = access.GetInterface::<ID3D11Texture2D>()?;
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                src_tex.GetDesc(&mut desc);
+                if desc.Width != rs.width || desc.Height != rs.height {
+                    return Ok(false);
+                }
+                rs.d3d_ctx.CopyResource(&rs.cap_tex, &src_tex);
+                Ok(true)
+            })();
             let _ = frame.Close();
+            got = result?;
         }
         if got {
             rs.has_frame.set(true);
+        }
+        // Reuse the existing swapchain image on a static desktop. Settings,
+        // fade and mode changes can redraw the cached capture without waiting
+        // for another WGC frame.
+        if !rs.has_frame.get() || (!got && !dirty) {
+            return Ok(());
         }
 
         let fade = fade();
@@ -898,6 +961,8 @@ mod imp {
 
         ctx.EndDraw(None, None)?;
         rs.swapchain.Present(0, Default::default()).ok()?;
+        rs.revision.set(revision);
+        sync_visibility(hwnd, rs);
         Ok(())
     }
 
@@ -957,8 +1022,15 @@ mod imp {
     // Decide whether this window should currently be visible and update its
     // show state to match. Visible whenever the overlay is active or still
     // fading out.
+    fn wants_capture() -> bool {
+        (ACTIVE.load(Ordering::Relaxed) || fade() > 0.0)
+            && (stddev() > 0.0 || DESATURATE.load(Ordering::Relaxed) || tint_strength() > 0.001)
+    }
+
     unsafe fn sync_visibility(hwnd: HWND, rs: &Render) {
-        let want = ACTIVE.load(Ordering::Relaxed) || fade() > 0.0;
+        // Never show a stale pre-suspension backbuffer before the first fresh
+        // frame has been presented. With every effect off the GPU layer is idle.
+        let want = wants_capture() && fade() > 0.0 && rs.has_frame.get();
         let was = rs.shown.get();
         if want && !was {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -977,30 +1049,28 @@ mod imp {
     ) -> LRESULT {
         unsafe {
             match msg {
-                WM_FRAME => {
-                    RENDER.with(|r| {
-                        if let Some(rs) = r.borrow().as_ref() {
-                            rs.frame_pending.store(false, Ordering::Release);
-                        }
-                    });
-                    render();
+                WM_TIMER if wparam.0 == RENDER_TIMER => {
+                    let stop = STOP.with(|s| s.borrow().as_ref()
+                        .map(|s| s.load(Ordering::Acquire)).unwrap_or(false));
+                    if stop {
+                        let _ = DestroyWindow(hwnd);
+                    } else {
+                        render(hwnd);
+                    }
                     LRESULT(0)
                 }
-                WM_GPU_SYNC => {
-                    RENDER.with(|r| {
-                        if let Some(rs) = r.borrow().as_ref() {
-                            sync_visibility(hwnd, rs);
-                        }
-                    });
-                    render();
+                WM_DISPLAYCHANGE => {
+                    let _ = DestroyWindow(hwnd);
                     LRESULT(0)
+                }
+                WM_POWERBROADCAST if wparam.0 == 18 || wparam.0 == 7 => {
+                    // PBT_APMRESUMEAUTOMATIC / PBT_APMRESUMESUSPEND. Recreate
+                    // even if the monitor handle and rectangle did not change.
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(1)
                 }
                 WM_DESTROY => {
-                    RENDER.with(|r| {
-                        if let Some(rs) = r.borrow().as_ref() {
-                            let _ = rs.framepool.RemoveFrameArrived(rs.frame_token);
-                        }
-                    });
+                    let _ = KillTimer(Some(hwnd), RENDER_TIMER);
                     PostQuitMessage(0);
                     LRESULT(0)
                 }

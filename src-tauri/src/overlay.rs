@@ -53,6 +53,7 @@ const GRAIN_DARK: f64 = 35.0;
 const TINT_STRENGTH_MAX: f32 = 0.50;
 
 static ALL_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+static DISPLAY_DIRTY: AtomicBool = AtomicBool::new(false);
 static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // Every HWND we've SetWindowPos'd below root_overlay during a session.
@@ -397,7 +398,15 @@ unsafe fn create_grain_surface(width: i32, height: i32) {
     }
 
     ReleaseDC(None, screen_dc);
-    *GRAIN_DC.lock().unwrap() = Some(mem_dc.0 as isize);
+    // Replace atomically with respect to update_grain_layer. Display changes
+    // can rebuild this surface repeatedly, so release the old DC and bitmap.
+    let mut grain = GRAIN_DC.lock().unwrap();
+    if let Some(old) = grain.replace(mem_dc.0 as isize) {
+        let old_dc = HDC(old as *mut _);
+        let bitmap = GetCurrentObject(old_dc, OBJ_BITMAP);
+        let _ = DeleteDC(old_dc);
+        let _ = DeleteObject(bitmap);
+    }
     *GRAIN_SIZE.lock().unwrap() = (width, height);
 }
 
@@ -1258,6 +1267,26 @@ fn foreground_tracker() {
         if hwnds.is_empty() { continue; }
 
         unsafe {
+            if DISPLAY_DIRTY.swap(false, Ordering::AcqRel) {
+                let sw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                let sh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                let sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                let sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                if sw > 0 && sh > 0 {
+                    create_grain_surface(sw, sh);
+                    for &value in &hwnds {
+                        let _ = SetWindowPos(HWND(value as *mut _), None,
+                            sx, sy, sw, sh, SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                    let progress = {
+                        let fade = FADE.lock().unwrap();
+                        ease_for_target(fade.progress, fade.target)
+                    };
+                    let vis = VISUALS.lock().unwrap();
+                    apply_all(&hwnds, &vis, progress);
+                    NEEDS_INITIAL_SETUP.store(true, Ordering::Relaxed);
+                }
+            }
             {
                 let mut fade = FADE.lock().unwrap();
                 if fade.animating {
@@ -1853,6 +1882,12 @@ unsafe extern "system" fn overlay_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
     }
 
     match msg {
+        WM_DISPLAYCHANGE => {
+            // Never wait for animation/GDI locks in the UI thread: the tracker
+            // can hold them while making synchronous Win32 window calls.
+            DISPLAY_DIRTY.store(true, Ordering::Release);
+            LRESULT(0)
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
