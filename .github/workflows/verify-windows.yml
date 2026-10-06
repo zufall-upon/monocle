@@ -44,13 +44,16 @@ jobs:
           if ($rendererTests.Count -lt 4) { throw "Expected at least 4 renderer lifecycle tests." }
           $inputTests = @($allTests | Select-String '^input_policy::tests::.+: test$')
           if ($inputTests.Count -lt 1) { throw "Expected Win32 visual input fixture." }
-          cargo test --locked --lib
+          cargo test --locked --lib -- --test-threads=1 --nocapture
       - name: Build Windows executable and NSIS installer
+        if: github.ref_name != 'investigate-z-order'
         run: npm run build -- --ci --bundles nsis -- --locked
       - name: Package executable with source SHA, hashes and limitations
+        if: github.ref_name != 'investigate-z-order'
         shell: pwsh
         run: ./scripts/package-windows.ps1
       - name: Upload verified build artifacts
+        if: github.ref_name != 'investigate-z-order'
         uses: actions/upload-artifact@v4
         with:
           name: deep-lite-windows-x64-${{ github.sha }}
