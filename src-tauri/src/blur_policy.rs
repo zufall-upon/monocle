@@ -133,6 +133,11 @@ pub fn required_bands(mix: f64, sigma: f32) -> [bool; 3] {
     if sigma <= 0.0 { [false; 3] } else if mix > 0.001 { [true; 3] } else { [false, false, true] }
 }
 
+pub fn needs_source_frame(mix: f64, sigma: f32, input_current: bool, sharp_current: bool) -> bool {
+    (required_bands(mix, sigma).iter().any(|&v| v) && !input_current)
+        || ((mix > 0.001 || sigma <= 0.0) && !sharp_current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,4 +304,13 @@ mod tests {
         } } }
         assert_eq!(blur, 9); // three levels once per monitor, not 4800 old draws
     }
+    #[test]
+    fn zero_to_weak_blur_on_static_frame_requires_ingestion() {
+        assert!(!needs_source_frame(0.0,0.0,false,true));
+        assert!(needs_source_frame(0.0,4.0,false,true));
+        assert!(!needs_source_frame(0.0,4.0,true,true));
+        assert!(needs_source_frame(1.0,24.0,true,false));
+        assert!(!needs_source_frame(0.0,24.0,true,false));
+    }
+
 }

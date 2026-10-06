@@ -95,7 +95,7 @@ pub fn set_focus_rects(_rects: &[(i32, i32, i32, i32)]) {}
 
 #[cfg(windows)]
 mod imp {
-    use crate::blur_policy::{processing_plan, required_bands, CaptureDemand, EffectKey, EffectValidity, Extent, SessionAction, UpdateState};
+    use crate::blur_policy::{processing_plan, required_bands, needs_source_frame, CaptureDemand, EffectKey, EffectValidity, Extent, SessionAction, UpdateState};
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -464,10 +464,10 @@ mod imp {
         height: u32,
     ) -> windows::core::Result<()> {
         // Prefer the adapter physically owning this monitor; never alter OS settings.
-        let factory: IDXGIFactory2 = CreateDXGIFactory2(Default::default())?;
+        let adapter_factory: IDXGIFactory2 = CreateDXGIFactory2(Default::default())?;
         let mut selected: Option<IDXGIAdapter> = None;
         let mut index = 0;
-        while let Ok(adapter) = factory.EnumAdapters1(index) {
+        while let Ok(adapter) = adapter_factory.EnumAdapters1(index) {
             let mut output_index = 0;
             while let Ok(output) = adapter.EnumOutputs(output_index) {
                 if output.GetDesc()?.Monitor.0 as isize == hmon {
@@ -756,7 +756,10 @@ mod imp {
             }
         }
         if !rs.updates.borrow().needs_draw(revision) { return Ok(()); }
-        if fade() <= 0.0 { return Ok(()); }
+        if fade() <= 0.0 {
+            if let Some(frame) = rs.frame.borrow_mut().take() { let _ = frame.Close(); }
+            return Ok(());
+        }
         let sigma = stddev();
         let mix = mode_mix();
         let fade = fade() as f32;
@@ -766,7 +769,7 @@ mod imp {
         let need_fresh_source = {
             let cache = rs.effects.borrow();
             cache.as_ref().map(|c| c.extent != plan.extent ||
-                ((mix > 0.001 || sigma <= 0.0) && c.raw_frame != Some(key.frame))).unwrap_or(true)
+                needs_source_frame(mix,sigma,c.input_frame == Some(key.frame),c.raw_frame == Some(key.frame))).unwrap_or(true)
         };
         if need_fresh_source && rs.frame.borrow().is_none() {
             // Deep did not keep a native source. Request a fresh frame for a
@@ -825,6 +828,7 @@ mod imp {
         let plan = processing_plan(Extent { width: rs.width, height: rs.height }, sigma);
         let mut cache = rs.effects.borrow_mut();
         if cache.as_ref().map(|c| c.extent != plan.extent).unwrap_or(true) {
+            log(&format!("processing monitor={},{} extent={}x{} divisor={}",rs.origin_x,rs.origin_y,plan.extent.width,plan.extent.height,plan.divisor));
             *cache = Some(EffectSurfaces { extent: plan.extent, input: effect_bitmap(&rs.ctx, plan.extent)?, input_frame: None, bands: [None,None,None], sharp: None, raw_sharp: None, raw_frame: None, validity: EffectValidity::default() });
         }
         let c = cache.as_mut().unwrap(); c.validity.update(key);
@@ -833,14 +837,17 @@ mod imp {
         let needs_sharp = (mix > 0.001 || sigma <= 0.0) && c.validity.needs_sharp();
         let needs_raw_sharp = needs_sharp && c.raw_frame != Some(key.frame);
         if needs_input || needs_raw_sharp {
-            let frame = rs.frame.borrow(); let frame = frame.as_ref().unwrap();
+            let frame = rs.frame.borrow(); let frame = frame.as_ref().ok_or_else(|| windows::core::Error::from_hresult(E_INVALIDARG))?;
             let access = frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?;
             let texture = access.GetInterface::<ID3D11Texture2D>()?;
             let surface: IDXGISurface = texture.cast()?;
             let props = D2D1_BITMAP_PROPERTIES1 {
                 pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE }, dpiX:96.0,dpiY:96.0,bitmapOptions:D2D1_BITMAP_OPTIONS_NONE,colorContext:std::mem::ManuallyDrop::new(None),
             };
-            let native = match rs.ctx.CreateBitmapFromDxgiSurface(&surface, Some(&props)) {
+            let direct = if rs.fallback_texture.borrow().is_some() {
+                Err(windows::core::Error::from_hresult(E_INVALIDARG))
+            } else { rs.ctx.CreateBitmapFromDxgiSurface(&surface, Some(&props)) };
+            let native = match direct {
                 Ok(bitmap) => bitmap,
                 Err(_) => {
                     // Compatibility fallback only: do not repeatedly recreate

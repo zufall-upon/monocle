@@ -83,7 +83,7 @@ The binary is `src-tauri/target/release/deep-lite.exe`; the installer is under
 `src-tauri/target/release/bundle/nsis/`. Compilation does not launch the app.
 
 The manual [Windows workflow](.github/workflows/verify-windows.yml) checks the
-Windows code, requires at least 13 blur-policy and 6 isolation tests, runs the
+Windows code, requires at least 14 blur-policy and 6 isolation tests, runs the
 library tests, builds/packages the exe and installer, and records source SHA,
 Authenticode status and hashes. It uses a standard GitHub-hosted Windows runner
 in this public repository. Releases link the successful run for their exact SHA.
