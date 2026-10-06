@@ -855,10 +855,12 @@ fn focus_diagnostics() -> String {
             let mut cls=[0u16;256];let n=GetClassNameW(hwnd,&mut cls).max(0) as usize;
             let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
             let owner=GetWindow(hwnd,GW_OWNER).unwrap_or_default().0 as isize;
-            out.push_str(&format!("sharp_reason={} ",crate::focus_policy::sharp_reason(id,&trace.sharp,is_ignored_hwnd(id),crate::focus_policy::exclusion(t))));
+            let exe=crate::windows_api::exe_name_for_hwnd(id).unwrap_or_default();
+            let matched_ignored=ignored.exes.iter().any(|entry| *entry==exe);
+            out.push_str(&format!("sharp_reason={} ",crate::focus_policy::sharp_reason(id,&trace.sharp,matched_ignored,crate::focus_policy::exclusion(t))));
             out.push_str(&format!("rank={rank} hwnd={id:#x} pid={pid} exe={} class={} owner={owner:#x} family={:#x} tool={} noactivate={} topmost={} anchor={} ignored={} exclusion={:?} above_root={} gpu={}\n",
-                crate::windows_api::exe_name_for_hwnd(id).unwrap_or_default(),String::from_utf16_lossy(&cls[..n]),root_owner(hwnd).0 as isize,
-                t.tool,t.no_activate,t.topmost,crate::focus_policy::can_anchor(t),is_ignored_hwnd(id),
+                exe,String::from_utf16_lossy(&cls[..n]),root_owner(hwnd).0 as isize,
+                t.tool,t.no_activate,t.topmost,crate::focus_policy::can_anchor(t),matched_ignored,
                 crate::focus_policy::exclusion(t),root!=0 && is_above_overlay(hwnd,HWND(root as *mut _)),
                 crate::gpu_blur::diagnostic_order(id)));
         }

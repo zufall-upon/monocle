@@ -29,7 +29,7 @@ The reports alone cannot establish that Firefox's raise lifted it or that a rece
 Firefox foreground transition was processed. New diagnostics expose that missing
 state: last observed real foreground, last processed foreground, retained anchors
 and sharp members, a bounded transition history, the exact normalized ignored list
-and its revision, and each window's sharp reason. No titles/URLs are added.
+and its revision, and each window's sharp reason. All rows match the same captured ignored-list snapshot. Window/z-order and tracker state are still sequential observations, not an atomic desktop snapshot; recapture after transitions settle. No titles/URLs are added.
 
 ## Confirmed code defects and changes
 
