@@ -40,11 +40,12 @@
     <div class="hint">Shake your mouse to toggle</div>
 
     <button class="ignore-current" id="ignore-current" hidden>
-      <span class="ignore-current-label">Ignore <strong id="ignore-current-name"></strong></span>
+      <span class="ignore-current-label">Keep <strong id="ignore-current-name"></strong> sharp (exclude from effects)</span>
       <span class="ignore-current-plus" aria-hidden="true">+</span>
     </button>
 
     <div class="controls">
+      <p id="ignored-warning" hidden style="font-size:12px;padding:8px 0"></p>
       <div class="control-group">
         <button id="focus-diagnostics">Show focus diagnostics</button>
         <textarea id="focus-diagnostics-output" readonly hidden rows="8" style="width:100%;user-select:text" aria-label="Focus diagnostics"></textarea>

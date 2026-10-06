@@ -247,16 +247,19 @@ function renderIgnoredApps() {
   const apps = settings.ignored_apps || [];
   list.innerHTML = "";
   empty.hidden = apps.length > 0;
+  const warning=document.getElementById("ignored-warning");
+  warning.hidden=apps.length===0;
+  warning.textContent=apps.length ? `Always sharp (excluded from effects): ${apps.map(a => a.exe).join(", ")}. Use “Apply effect” under Ignored apps to remove an exclusion.` : "";
   for (const app of apps) {
     const row = document.createElement("div");
     row.className = "ignored-app-row";
     const name = document.createElement("span");
     name.className = "ignored-app-name";
-    name.textContent = app.name || app.exe;
+    name.textContent = `${app.name || app.exe} (${app.exe}) — always sharp`;
     const remove = document.createElement("button");
-    remove.className = "icon-btn";
-    remove.setAttribute("aria-label", `Stop ignoring ${app.name || app.exe}`);
-    remove.textContent = "−"; // minus sign
+    remove.className = "ignored-apply-btn";
+    remove.setAttribute("aria-label", `Apply effect to ${app.name || app.exe}`);
+    remove.textContent = "Apply effect";
     remove.addEventListener("click", () => removeIgnoredApp(app.exe));
     row.append(name, remove);
     list.append(row);

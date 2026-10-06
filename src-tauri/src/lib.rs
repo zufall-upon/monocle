@@ -49,6 +49,9 @@ fn update_settings(app: tauri::AppHandle, state: tauri::State<AppState>, new_set
             || s.mode_shortcut != new_settings.mode_shortcut
             || s.settings_shortcut != new_settings.settings_shortcut;
         let start_changed = s.start_on_login != new_settings.start_on_login;
+        if s.ignored_exes()!=new_settings.ignored_exes() {
+            logging::log(&format!("ignored_apps changed via update_settings: {:?} -> {:?}",s.ignored_exes(),new_settings.ignored_exes()));
+        }
         *s = new_settings.clone();
         s.save();
         (shortcuts_changed, start_changed)

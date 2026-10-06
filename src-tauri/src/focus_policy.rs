@@ -163,3 +163,71 @@ mod classification_tests {
         assert_eq!(visible_owner_root(1,&[(1,2,true),(2,1,true)]),2);
     }
 }
+
+/// Initial setup must use focus, not a z-order changed by ignored-app lifting.
+pub fn setup_anchors(previous: &[(isize,isize)], windows: &[Window], current: isize, last_real: isize, per_monitor: bool) -> (Option<isize>,Vec<(isize,isize)>) {
+    let preferred=[current,last_real].into_iter().find(|id| windows.iter().any(|w| w.id==*id));
+    (preferred,anchors(previous,windows,preferred,per_monitor))
+}
+
+#[derive(Clone,Debug)]
+pub struct IgnoredConfig { pub revision:u64, pub exes:Vec<String> }
+impl IgnoredConfig {
+    pub const fn new()->Self { Self { revision:0, exes:Vec::new() } }
+    pub fn replace(&mut self, exes:Vec<String>)->bool {
+        if self.exes==exes { return false; }
+        self.exes=exes; self.revision=self.revision.wrapping_add(1); true
+    }
+    pub fn needs_refresh(&self, acknowledged:Option<u64>, periodic:bool, setup:bool)->bool {
+        acknowledged!=Some(self.revision) || periodic || setup
+    }
+}
+
+pub fn sharp_reason(id:isize,group:&[isize],ignored:bool,excluded:Option<&'static str>)->&'static str {
+    if ignored { "settings.ignored_apps" }
+    else if group.contains(&id) { "retained-focus-group" }
+    else if excluded.is_some() { "excluded-window-category" }
+    else { "background-effect-expected" }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+    fn w(id:isize,monitor:isize)->Window { Window{id,monitor} }
+    #[test] fn ignored_raise_cannot_replace_actual_global_foreground() {
+        let z=[w(10,1),w(20,1),w(30,2)]; // ignored Firefox was lifted above TE
+        assert_eq!(setup_anchors(&[],&z,20,30,false).1,vec![(1,20)]);
+    }
+    #[test] fn ignore_edit_with_settings_foreground_keeps_last_real_app() {
+        let z=[w(10,1),w(20,1),w(30,2)];
+        let (_,selected)=setup_anchors(&[(1,20)],&z,999,20,false);
+        assert_eq!(selected,vec![(1,20)]);
+        assert_eq!(sharp_reason(10,&[20],true,None),"settings.ignored_apps");
+        assert_eq!(sharp_reason(10,&[20],false,None),"background-effect-expected");
+        assert_eq!(sharp_reason(20,&[20],false,None),"retained-focus-group");
+    }
+    #[test] fn display_change_and_monitor_transfer_preserve_valid_anchors() {
+        let z=[w(10,1),w(20,2),w(30,1)];
+        let (_,chosen)=setup_anchors(&[(1,30),(2,20)],&z,999,20,true);
+        assert!(chosen.contains(&(1,30))); assert!(chosen.contains(&(2,20)));
+    }
+    #[test] fn stale_last_real_is_revalidated_after_close_or_minimize() {
+        let z=[w(10,1),w(30,1)];
+        assert_eq!(setup_anchors(&[(1,30)],&z,999,20,false).1,vec![(1,30)]);
+        assert_eq!(setup_anchors(&[(1,20)],&z,999,20,false).1,vec![(1,10)]);
+        assert!(setup_anchors(&[(1,20)],&[],999,20,false).1.is_empty());
+    }
+    #[test] fn enumeration_acknowledges_snapshot_not_a_concurrent_update() {
+        let mut config=IgnoredConfig::new();
+        assert!(config.replace(vec!["firefox.exe".into()]));
+        let snapshot=config.clone(); // released configuration lock, enumerating
+        assert!(config.replace(vec![])); // another settings update meanwhile
+        let acknowledged=Some(snapshot.revision);
+        assert!(config.needs_refresh(acknowledged,false,false));
+        let next=config.clone();
+        assert!(next.exes.is_empty());
+        assert!(!config.needs_refresh(Some(next.revision),false,false));
+        assert!(config.needs_refresh(Some(next.revision),false,true));
+        assert!(!config.replace(vec![]));
+    }
+}

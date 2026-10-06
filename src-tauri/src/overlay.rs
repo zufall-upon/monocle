@@ -80,7 +80,22 @@ static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 // neutralized in the blur), regardless of focus or any other setting. Set from
 // settings via `update_overlay`. Empty is the common case and short-circuits
 // all per-tick work.
-static IGNORED_EXES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static IGNORED_CONFIG: Mutex<crate::focus_policy::IgnoredConfig> = Mutex::new(crate::focus_policy::IgnoredConfig::new());
+static LAST_REAL_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
+#[derive(Clone)]
+struct FocusTrace { tracked:isize, anchors:Vec<(isize,isize)>, sharp:Vec<isize>, events:Vec<String> }
+static FOCUS_TRACE: Mutex<FocusTrace> = Mutex::new(FocusTrace { tracked:0,anchors:Vec::new(),sharp:Vec::new(),events:Vec::new() });
+fn publish_focus(groups:&HashMap<isize,Vec<isize>>,tracked:isize,event:&str) {
+    let mut anchors:Vec<_>=groups.iter().filter_map(|(&mon,g)|g.first().map(|&id|(mon,id))).collect();
+    anchors.sort_unstable();
+    let mut sharp:Vec<_>=groups.values().flatten().copied().collect();sharp.sort_unstable();sharp.dedup();
+    let mut trace=FOCUS_TRACE.lock().unwrap();
+    if trace.tracked==tracked && trace.anchors==anchors && trace.sharp==sharp { return; }
+    let millis=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    trace.events.push(format!("unix_ms={millis} event={event} tracked={tracked:#x} anchors={anchors:x?} sharp={sharp:x?}"));
+    if trace.events.len()>12 { trace.events.remove(0); }
+    trace.tracked=tracked;trace.anchors=anchors;trace.sharp=sharp;
+}
 // Sentinel key for the ignored-app group in the focus-rect map. Real keys are
 // HMONITOR handles (always positive), so -1 never collides.
 const IGNORED_FOCUS_KEY: isize = -1;
@@ -564,7 +579,8 @@ fn is_effect_target(hwnd: HWND) -> bool {
 /// Short-circuits when no apps are ignored — the common case.
 #[cfg(windows)]
 fn is_ignored_hwnd(hwnd_val: isize) -> bool {
-    let ignored = IGNORED_EXES.lock().unwrap();
+    let config = IGNORED_CONFIG.lock().unwrap();
+    let ignored = &config.exes;
     if ignored.is_empty() {
         return false;
     }
@@ -578,8 +594,7 @@ fn is_ignored_hwnd(hwnd_val: isize) -> bool {
 /// free) when nothing is ignored. Resolves each window's exe, so callers throttle
 /// how often they invoke it rather than running it every 16ms tick.
 #[cfg(windows)]
-fn ignored_hwnds() -> Vec<isize> {
-    let ignored: Vec<String> = IGNORED_EXES.lock().unwrap().clone();
+fn ignored_hwnds(ignored: Vec<String>) -> Vec<isize> {
     if ignored.is_empty() {
         return Vec::new();
     }
@@ -821,6 +836,11 @@ fn focus_diagnostics() -> String {
         let mut out=format!("per_monitor={} app_wide={} static={} foreground={:#x} root={root:#x}\n",
             OVERLAY_PER_MONITOR.load(Ordering::Relaxed),APP_WIDE_FOCUS.load(Ordering::Relaxed),
             STATIC_MASK.load(Ordering::Relaxed),GetForegroundWindow().0 as isize);
+        let trace=FOCUS_TRACE.lock().unwrap().clone();
+        let ignored=IGNORED_CONFIG.lock().unwrap().clone();
+        out.push_str(&format!("last_real_foreground={:#x} tracked_foreground={:#x} retained_anchors={:x?} retained_sharp={:x?}\nignored_source=settings.ignored_apps ignored_revision={} normalized_ignored_exes={:?}\n",
+            LAST_REAL_FOREGROUND.load(Ordering::Relaxed),trace.tracked,trace.anchors,trace.sharp,ignored.revision,ignored.exes));
+        for event in &trace.events { out.push_str(event);out.push('\n'); }
         unsafe extern "system" fn collect(hwnd: HWND,param: LPARAM)->BOOL {
             if IsWindowVisible(hwnd).as_bool() {
                 (*(param.0 as *mut Vec<isize>)).push(hwnd.0 as isize);
@@ -835,6 +855,7 @@ fn focus_diagnostics() -> String {
             let mut cls=[0u16;256];let n=GetClassNameW(hwnd,&mut cls).max(0) as usize;
             let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
             let owner=GetWindow(hwnd,GW_OWNER).unwrap_or_default().0 as isize;
+            out.push_str(&format!("sharp_reason={} ",crate::focus_policy::sharp_reason(id,&trace.sharp,is_ignored_hwnd(id),crate::focus_policy::exclusion(t))));
             out.push_str(&format!("rank={rank} hwnd={id:#x} pid={pid} exe={} class={} owner={owner:#x} family={:#x} tool={} noactivate={} topmost={} anchor={} ignored={} exclusion={:?} above_root={} gpu={}\n",
                 crate::windows_api::exe_name_for_hwnd(id).unwrap_or_default(),String::from_utf16_lossy(&cls[..n]),root_owner(hwnd).0 as isize,
                 t.tool,t.no_activate,t.topmost,crate::focus_policy::can_anchor(t),is_ignored_hwnd(id),
@@ -1207,6 +1228,8 @@ fn foreground_tracker() {
     // apps push the entire previous group down at once.
     let mut monitor_focused: HashMap<isize, Vec<isize>> = HashMap::new();
     let mut last_fg: isize = 0;
+    let mut last_observed_raw:isize = 0;
+    let mut ignored_acknowledged:Option<u64> = None;
     let mut last_reconcile = std::time::Instant::now();
 
     // Cached set of ignored-app windows. Resolving each window's exe is too
@@ -1337,20 +1360,32 @@ fn foreground_tracker() {
                 }
             }
 
+            // Observe real app focus even while OFF, before opening our settings.
+            let observed=GetForegroundWindow();
+            if observed.0 as isize != last_observed_raw {
+                last_observed_raw=observed.0 as isize;
+                if is_eligible_window(observed,&hwnds) {
+                    LAST_REAL_FOREGROUND.store(last_observed_raw,Ordering::Relaxed);
+                }
+            }
             if !OVERLAY_ACTIVE.load(Ordering::Relaxed) {
                 last_fg = 0;
                 monitor_focused.clear();
                 ignored.clear();
+                ignored_acknowledged=None;
+                publish_focus(&monitor_focused,last_fg,"inactive");
                 continue;
             }
 
-            // Refresh the ignored-app window set on a slow cadence (exe lookups
-            // are too costly per tick). Foreground changes also force a refresh
-            // further down so a newly-opened ignored window goes sharp promptly.
-            if ignored_refresh == 0 {
-                ignored = ignored_hwnds();
+            let setup=NEEDS_INITIAL_SETUP.swap(false,Ordering::AcqRel);
+            // Snapshot entries and revision together. A change during enumeration
+            // remains pending: acknowledge the snapshot, never the latest revision.
+            let snapshot=IGNORED_CONFIG.lock().unwrap().clone();
+            if snapshot.needs_refresh(ignored_acknowledged,ignored_refresh==0,setup) {
+                ignored=ignored_hwnds(snapshot.exes);
+                ignored_acknowledged=Some(snapshot.revision);
             }
-            ignored_refresh = (ignored_refresh + 1) % IGNORED_REFRESH_TICKS;
+            ignored_refresh=(ignored_refresh+1)%IGNORED_REFRESH_TICKS;
 
             // Keep every GPU blur window pinned directly above the top blur
             // placeholder (hwnds[9]) — and therefore below tint/grain. The
@@ -1423,9 +1458,9 @@ fn foreground_tracker() {
                 }
             }
 
-            if NEEDS_INITIAL_SETUP.swap(false, Ordering::Relaxed) {
+            if setup {
                 let root_overlay = HWND(hwnds[0] as *mut _);
-                monitor_focused.clear();
+                let previous:Vec<_>=monitor_focused.iter().filter_map(|(&mon,g)|g.first().map(|&id|(mon,id))).collect();
 
                 // Snapshot every eligible window once, top-to-bottom in z-order.
                 // This is the ground truth we re-stack against — we never invent
@@ -1435,33 +1470,17 @@ fn foreground_tracker() {
                 let z_ordered = enumerate_eligible_in_z_order(&hwnds);
                 let per_monitor = OVERLAY_PER_MONITOR.load(Ordering::Relaxed);
 
-                // Decide which windows stay sharp.
-                //   * per-monitor on: each monitor's topmost window, expanded to
-                //     its focus group (owner-chain, or the whole app on that
-                //     monitor when app-wide focus is on).
-                //   * per-monitor off: a single global group — the topmost
-                //     window overall and its focus group.
-                let mut sharp_set: std::collections::HashSet<isize> =
-                    std::collections::HashSet::new();
-                if per_monitor {
-                    let mut seen: std::collections::HashSet<isize> =
-                        std::collections::HashSet::new();
-                    for &w in &z_ordered {
-                        let mon = MonitorFromWindow(
-                            HWND(w as *mut _), MONITOR_DEFAULTTONEAREST,
-                        ).0 as isize;
-                        if !seen.insert(mon) { continue; }
-                        let group = focused_group(HWND(w as *mut _), &hwnds, mon);
-                        for &g in &group { sharp_set.insert(g); }
-                        monitor_focused.insert(mon, group);
-                    }
-                } else if let Some(&top) = z_ordered.first() {
-                    let mon = MonitorFromWindow(
-                        HWND(top as *mut _), MONITOR_DEFAULTTONEAREST,
-                    ).0 as isize;
-                    let group = focused_group(HWND(top as *mut _), &hwnds, mon);
-                    for &g in &group { sharp_set.insert(g); }
-                    monitor_focused.insert(mon, group);
+                let windows:Vec<_>=z_ordered.iter().map(|&id| crate::focus_policy::Window {
+                    id,monitor:MonitorFromWindow(HWND(id as *mut _),MONITOR_DEFAULTTONEAREST).0 as isize,
+                }).collect();
+                let (preferred,anchors)=crate::focus_policy::setup_anchors(&previous,&windows,
+                    GetForegroundWindow().0 as isize,LAST_REAL_FOREGROUND.load(Ordering::Relaxed),per_monitor);
+                monitor_focused.clear();
+                let mut sharp_set=std::collections::HashSet::new();
+                for (mon,id) in anchors {
+                    let group=focused_group(HWND(id as *mut _),&hwnds,mon);
+                    sharp_set.extend(group.iter().copied());
+                    monitor_focused.insert(mon,group);
                 }
 
                 // Ignored apps always stay sharp regardless of focus, so fold
@@ -1549,7 +1568,8 @@ fn foreground_tracker() {
                     }
                 }
 
-                last_fg = GetForegroundWindow().0 as isize;
+                last_fg=preferred.unwrap_or(0);
+                publish_focus(&monitor_focused,last_fg,"setup");
                 continue;
             }
 
@@ -1562,6 +1582,7 @@ fn foreground_tracker() {
                 && (fg_val == last_fg || !is_eligible_window(fg,&hwnds))
             {
                 reconcile_focus(&mut monitor_focused,&hwnds,&ignored,fg);
+                publish_focus(&monitor_focused,last_fg,"reconcile");
                 last_reconcile = std::time::Instant::now();
             }
 
@@ -1647,7 +1668,10 @@ fn foreground_tracker() {
                 }
             }
 
-            if fg_val == last_fg { continue; }
+            if fg_val == last_fg {
+                publish_focus(&monitor_focused,last_fg,"monitor-lifecycle");
+                continue;
+            }
 
             // Foreground changed — re-resolve ignored windows next tick so a
             // newly-opened or newly-focused ignored app goes sharp promptly
@@ -1778,6 +1802,7 @@ fn foreground_tracker() {
             }
 
             last_fg = fg_val;
+            publish_focus(&monitor_focused,last_fg,"foreground-change");
         }
     }
 }
@@ -1852,17 +1877,12 @@ pub fn update_overlay(settings: &AppSettings, active: bool) {
     // fresh focus pass so newly-ignored apps pop sharp and un-ignored ones
     // blur immediately, instead of waiting for the next foreground change.
     {
-        let new_ignored: Vec<String> = settings
-            .ignored_apps
-            .iter()
-            .map(|a| a.exe.to_lowercase())
-            .collect();
-        let mut cur = IGNORED_EXES.lock().unwrap();
-        if active && *cur != new_ignored {
-            NEEDS_INITIAL_SETUP.store(true, Ordering::Relaxed);
+        let mut config=IGNORED_CONFIG.lock().unwrap();
+        if config.replace(settings.ignored_exes()) && active {
+            NEEDS_INITIAL_SETUP.store(true,Ordering::Release);
         }
-        *cur = new_ignored;
     }
+
     BLUR_TASKBAR.store(settings.blur_taskbar, Ordering::Relaxed);
     HIDE_DESKTOP_ICONS.store(settings.hide_desktop_icons, Ordering::Relaxed);
     *FADE_MS.lock().unwrap() = settings.fade_duration_secs * 1000.0;

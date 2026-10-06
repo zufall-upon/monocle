@@ -35,11 +35,13 @@ CI: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
 
 Compiled and packaged with the Tauri CLI on a standard GitHub-hosted Windows runner.
 Rust policy tests passed in this run; GPU/UI runtime was NOT exercised.
-Focus/input repair preview: new settings default to Live blur; explicit prior
+Ignored/focus-retention follow-up: new settings default to Live blur; explicit prior
 renderer choices (including Static) are preserved. Choose Live blur in settings.
 Visual HWNDs are layered/nonactivating/input-transparent. First-click absorption
 is removed; native app/desktop actions pass through. Tool-window classification
-and hidden-owner grouping are repaired. Topmost windows remain outside the effect.
+and hidden-owner grouping are repaired. Rebuilds now preserve real focus and refresh
+Ignored caches from versioned snapshots. No saved exclusions are auto-removed.
+Topmost windows remain outside the effect.
 The native WindowFromPoint fixture does not establish real desktop gesture behavior.
 Actual Firefox/Tablacus, 3-monitor operation and GPU savings remain unverified.
 Operation counters: %TEMP%\deep-lite-gpu-blur.log (10-second cumulative samples).

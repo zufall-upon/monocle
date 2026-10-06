@@ -3,6 +3,29 @@
 An experimental focus-overlay fork of [Deep / Monocle](https://github.com/brycelewiswork/monocle)
 by Bryce Lewis for Windows 10/11 x64. Upstream's MIT license is retained in [LICENSE](LICENSE).
 
+## Ignored-app and focus-retention follow-up
+
+A supplied Preview 4 diagnostic has `firefox.exe` matched by `settings.ignored_apps`.
+This explains why those windows are kept sharp. The default list is empty; there
+is no Firefox exception. The diagnostic cannot establish when or why that saved
+entry was added. No exclusions are automatically removed by this update.
+
+To apply the effect to Firefox, choose **Ignored apps → Firefox → Apply effect**.
+The UI now spells out that Ignored apps always stay sharp. The quick-add button
+explicitly says “Keep … sharp (exclude from effects)”. Live Blur and other saved
+preferences are preserved.
+
+Setup after settings/display changes now prioritizes the actual eligible foreground,
+then the last real foreground, then a valid retained anchor, before z-order fallback.
+An Ignored app being raised no longer steals the focus anchor during this rebuild.
+Ignored-window caches refresh from a versioned settings snapshot, including during
+rapid edits. Diagnostics show last real/tracked foreground, retained groups, recent
+transitions, matching configuration and a per-window sharp reason.
+
+Both supplied snapshots were taken with Deep Lite settings in the foreground.
+Tablacus being sharp may therefore be retained prior focus; it is not yet proof
+that Firefox's lift dragged Tablacus above the effect. [Evidence and limits](docs/ignored-focus-followup.md).
+
 ## Focus and desktop-input repair preview
 
 New settings default to **Live blur**. Existing explicit Renderer choices are
@@ -107,7 +130,7 @@ The binary is `src-tauri/target/release/deep-lite.exe`; the installer is under
 `src-tauri/target/release/bundle/nsis/`. Compilation does not launch the app.
 
 The manual [Windows workflow](.github/workflows/verify-windows.yml) checks the
-Windows code, requires at least 14 blur-policy, 7 isolation/settings, 13 focus and
+Windows code, requires at least 14 blur-policy, 8 isolation/settings, 18 focus and
 4 renderer-lifecycle tests plus a native Win32 input-target fixture, runs the
 library tests, builds/packages the exe and installer, and records source SHA,
 Authenticode status and hashes. It uses a standard GitHub-hosted Windows runner

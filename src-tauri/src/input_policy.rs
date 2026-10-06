@@ -64,6 +64,27 @@ mod tests {
                 let _=ShowWindow(visual.0,SW_HIDE);
                 assert_eq!(WindowFromPoint(point),base.0);
             }}
+            // A nonactivating ignored-app lift alone must not lift an unrelated
+            // background app. Foreground-selection policy is tested separately.
+            let divider=Owned(CreateWindowExW(visual_ex_style(true),cls,w!("divider"),visual_style(),300,100,50,50,None,None,Some(instance.into()),None).unwrap());
+            SetLayeredWindowAttributes(divider.0,COLORREF(0),180,LWA_ALPHA).unwrap();
+            let ignored=Owned(CreateWindowExW(WS_EX_TOOLWINDOW,cls,w!("ignored fixture"),WS_POPUP,400,100,50,50,None,None,Some(instance.into()),None).unwrap());
+            let _=ShowWindow(divider.0,SW_SHOWNOACTIVATE);
+            let _=ShowWindow(ignored.0,SW_SHOWNOACTIVATE);
+            let flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE;
+            SetWindowPos(divider.0,Some(HWND_TOP),0,0,0,0,flags).unwrap();
+            SetWindowPos(base.0,Some(divider.0),0,0,0,0,flags).unwrap();
+            let before=GetForegroundWindow();
+            SetWindowPos(ignored.0,Some(HWND_TOP),0,0,0,0,flags).unwrap();
+            assert_eq!(GetForegroundWindow(),before,"ignored raise must not activate");
+            let mut cursor=divider.0;
+            let mut found=false;
+            for _ in 0..4096 {
+                cursor=GetWindow(cursor,GW_HWNDNEXT).unwrap_or_default();
+                if cursor==base.0 { found=true;break; }
+                if cursor.0.is_null() { break; }
+            }
+            assert!(found,"ignored raise must leave unrelated base below divider");
         }
     }
 }

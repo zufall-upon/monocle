@@ -100,6 +100,11 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// Runtime matching never writes back or invents exclusions.
+    pub fn ignored_exes(&self) -> Vec<String> {
+        self.ignored_apps.iter().map(|app| app.exe.to_lowercase()).collect()
+    }
+
     fn load_from_dir(dir: &std::path::Path) -> Self {
         // Only the provided fork directory is read. No legacy fallback.
         std::fs::read_to_string(dir.join("settings.json"))
@@ -128,6 +133,18 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignored_matches_come_only_from_saved_entries_without_default_exceptions() {
+        let mut settings=AppSettings::default();
+        assert!(settings.ignored_exes().is_empty());
+        settings.ignored_apps.push(IgnoredApp { exe:"FireFox.EXE".into(),name:"Browser".into() });
+        let json=serde_json::to_string(&settings).unwrap();
+        let restored:AppSettings=serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.ignored_exes(),vec!["firefox.exe"]);
+        assert_eq!(restored.ignored_apps[0].exe,"FireFox.EXE");
+        assert!(!restored.ignored_exes().contains(&"te64.exe".to_string()));
+    }
 
     #[test]
     fn renderer_migration_defaults_to_live_and_preserves_explicit_preferences() {

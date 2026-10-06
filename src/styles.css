@@ -727,3 +727,9 @@ input[type="range"]::-webkit-slider-thumb:active {
   border-radius: 6px; font: inherit;
 }
 input:disabled, button:disabled { opacity: .35; cursor: default; }
+
+.ignored-apply-btn {
+  flex-shrink: 0; padding: 5px 8px; color: var(--text);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 5px; cursor: pointer; font: inherit; font-size: 11px;
+}
