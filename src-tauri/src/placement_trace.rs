@@ -15,10 +15,10 @@ impl Budget {
 }
 struct Pending { id:isize, root:isize, pid:u32, tid:u32, at:u64, text:String }
 struct Trace { start:Instant, budget:Budget, attempts:u64, errors:u64, sampled:u64,
-    skipped_ignored:u64, skipped_ineligible:u64, pending:Vec<Pending>, records:VecDeque<String>, disk_lines:u32 }
+    skipped_ignored:u64, skipped_ineligible:u64, divider_attempts:u64, divider_repairs:u64, divider_last:String, divider_logged:Option<Instant>, pending:Vec<Pending>, records:VecDeque<String>, disk_lines:u32 }
 impl Trace {
     fn new()->Self { Self { start:Instant::now(),budget:Budget::default(),attempts:0,errors:0,sampled:0,
-        skipped_ignored:0,skipped_ineligible:0,pending:Vec::new(),records:VecDeque::new(),disk_lines:0 } }
+        skipped_ignored:0,skipped_ineligible:0,divider_attempts:0,divider_repairs:0,divider_last:String::new(),divider_logged:None,pending:Vec::new(),records:VecDeque::new(),disk_lines:0 } }
 }
 static TRACE:LazyLock<Mutex<Trace>>=LazyLock::new(||Mutex::new(Trace::new()));
 
@@ -102,6 +102,18 @@ pub unsafe fn observe_next() {
     }
 }
 
+pub fn divider_result(target:isize,result:&windows::core::Result<bool>) {
+    let mut trace=TRACE.lock().unwrap();
+    trace.divider_attempts+=1;
+    if matches!(result,Ok(true)) {trace.divider_repairs+=1;}
+    trace.divider_last=format!("target={target:#x} result={result:?}");
+    let line=format!("divider_fallback attempts={} repairs={} {}",trace.divider_attempts,trace.divider_repairs,trace.divider_last);
+    let log=trace.disk_lines<120 && trace.divider_logged.is_none_or(|t|t.elapsed().as_secs()>=2);
+    if log {trace.disk_lines+=1;trace.divider_logged=Some(Instant::now());}
+    drop(trace);
+    if log {crate::logging::log(&line);}
+}
+
 pub fn skipped(ignored:bool) {
     let mut trace=TRACE.lock().unwrap();
     if ignored {trace.skipped_ignored+=1;} else {trace.skipped_ineligible+=1;}
@@ -109,8 +121,9 @@ pub fn skipped(ignored:bool) {
 
 pub fn report()->String {
     let trace=TRACE.lock().unwrap();
-    format!("placement_diagnostic=1 attempts={} api_errors={} skipped_ignored={} skipped_ineligible={} sampled={} pending={} disk_lines={}/120 sampling=4_per_second_global,1_per_2_seconds_per_hwnd records=last_16\n{}\n",
+    format!("placement_diagnostic=1 attempts={} api_errors={} skipped_ignored={} skipped_ineligible={} sampled={} pending={} disk_lines={}/120 sampling=4_per_second_global,1_per_2_seconds_per_hwnd records=last_16\ndivider_fallback attempts={} repairs={} {}\n{}\n",
         trace.attempts,trace.errors,trace.skipped_ignored,trace.skipped_ineligible,trace.sampled,trace.pending.len(),trace.disk_lines,
+        trace.divider_attempts,trace.divider_repairs,trace.divider_last,
         trace.records.iter().cloned().collect::<Vec<_>>().join("\n"))
 }
 

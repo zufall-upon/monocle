@@ -35,7 +35,8 @@ CI: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
 
 Compiled and packaged with the Tauri CLI on a standard GitHub-hosted Windows runner.
 Rust policy tests passed in this run; GPU/UI runtime was NOT exercised.
-PLACEMENT DIAGNOSTIC BUILD: Firefox/Tablacus symptom resolution is NOT confirmed.
+PLACEMENT REPAIR PREVIEW: Firefox real-PC resolution is NOT confirmed.
+Moves our divider above a refusing background only when protected windows stay above.
 Bounded before/after/next-tick placement samples appear in Show focus diagnostics.
 Independent shared-owner demotion repair included; no settings reset required.
 Ignored/focus-retention follow-up: new settings default to Live blur; explicit prior
