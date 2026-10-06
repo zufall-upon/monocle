@@ -3,6 +3,7 @@
 use windows::{core::w, Win32::{Foundation::*, System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::*}};
 
+static OWNER_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 struct Window(HWND);
 impl Drop for Window { fn drop(&mut self) { unsafe { let _ = DestroyWindow(self.0); } } }
 unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -10,6 +11,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT
 }
 unsafe fn place(h: HWND, after: HWND) {
     SetWindowPos(h,Some(after),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE).unwrap();
+}
+unsafe fn app_place(h: HWND, after: HWND, lowering: bool) {
+    let bit=if lowering {1} else {2};
+    let preserve=OWNER_MODE.load(std::sync::atomic::Ordering::Relaxed)&bit!=0;
+    let flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE;
+    let flags=if preserve {flags|SWP_NOOWNERZORDER} else {flags};
+    SetWindowPos(h,Some(after),0,0,0,0,flags).unwrap();
 }
 unsafe fn above(h: HWND, other: HWND) -> bool {
     let mut cur=h;
@@ -52,8 +60,12 @@ fn native_three_gpu_windows_with_ignored_owner_and_settings_transitions() {
         let instance=GetModuleHandleW(None).unwrap();
         assert_ne!(RegisterClassExW(&WNDCLASSEXW{cbSize:std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc:Some(proc),hInstance:instance.into(),lpszClassName:w!("DeepLiteZFixture"),..Default::default()}),0);
+        for owner_mode in 0..4 {
+        OWNER_MODE.store(owner_mode,std::sync::atomic::Ordering::Relaxed);
+        let mut violations=Vec::<String>::new();
+        macro_rules! check { ($condition:expr, $message:expr) => { if !$condition { violations.push($message.into()); } }; }
         for shared_hidden_owner in [false,true] {
-        println!("scenario shared_hidden_owner={shared_hidden_owner}");
+        println!("scenario owner_mode={owner_mode} shared_hidden_owner={shared_hidden_owner}");
         let helper=create(None,false,820);
         let _=ShowWindow(helper.0,SW_HIDE);
         let common=if shared_hidden_owner {Some(helper.0)} else {None};
@@ -67,47 +79,75 @@ fn native_three_gpu_windows_with_ignored_owner_and_settings_transitions() {
         let active=create(common,false,580);
         let settings=create(None,false,700);
         place(settings.0,HWND_TOPMOST);
-        let named=[("root",root.0),("tint",tint.0),("grain",grain.0),
+        let named=[("hidden-helper",helper.0),("root",root.0),("tint",tint.0),("grain",grain.0),
             ("gpu0",gpu[0].0),("gpu1",gpu[1].0),("gpu2",gpu[2].0),
             ("ignored",ignored.0),("background",background.0),("popup",popup.0),
             ("active",active.0),("settings",settings.0)];
         let pin_gpu=|| { for g in &gpu { place(g.0,root.0); } };
         // Preview 5 setup: sharp block, root, background block, then GPU pin.
         focus(active.0);
-        place(ignored.0,HWND_TOP); place(active.0,ignored.0); place(root.0,active.0);
-        place(popup.0,root.0); place(background.0,popup.0); pin_gpu();
+        app_place(ignored.0,HWND_TOP,false); dump("setup-raise-ignored",&named);
+        app_place(active.0,ignored.0,false); dump("setup-raise-active",&named);
+        place(root.0,active.0); dump("setup-move-root",&named);
+        app_place(popup.0,root.0,true); dump("setup-lower-popup",&named);
+        app_place(background.0,popup.0,true); dump("setup-lower-background",&named);
+        pin_gpu();
         dump("setup",&named);
         for g in &gpu {
-            assert!(!above(background.0,g.0),"background above GPU after setup");
-            assert!(!above(popup.0,g.0),"popup above GPU after setup");
-            assert!(above(active.0,g.0)); assert!(above(ignored.0,g.0));
+            check!(!above(background.0,g.0),"background above GPU after setup");
+            check!(!above(popup.0,g.0),"popup above GPU after setup");
+            check!(above(active.0,g.0),"active below GPU"); check!(above(ignored.0,g.0),"ignored below GPU");
         }
         // Actual settings activation, retain active anchor, then return.
         focus(settings.0); pin_gpu(); focus(active.0); pin_gpu();
         dump("settings-return",&named);
-        for g in &gpu { assert!(!above(background.0,g.0)); }
+        for g in &gpu { check!(!above(background.0,g.0),"background above GPU after settings return"); }
         // Activate the owner family, then another app: same demotion sequence
         // as the foreground tracker (owner first in the focused group).
-        focus(background.0); place(popup.0,background.0); pin_gpu();
-        focus(active.0); place(background.0,root.0); place(popup.0,root.0);
+        focus(background.0); app_place(popup.0,background.0,false); pin_gpu();
+        focus(active.0); app_place(background.0,root.0,true); app_place(popup.0,root.0,true);
         dump("immediately-after-demotion",&named);
         println!("root boundary says background above={} while GPU0 above={}",
             above(background.0,root.0),above(background.0,gpu[0].0));
         // Model two complete tracker ticks, not just the immediate transient.
         for _ in 0..2 {
             pin_gpu();
-            if !above(ignored.0,root.0) { place(ignored.0,HWND_TOP); }
-            for h in [popup.0,background.0] { if above(h,root.0) { place(h,root.0); } }
+            if !above(ignored.0,root.0) { app_place(ignored.0,HWND_TOP,false); }
+            for h in [popup.0,background.0] { if above(h,root.0) { app_place(h,root.0,true); } }
             pump();
         }
         dump("settled",&named);
+        check!(!above(background.0,root.0),"inactive owner remains above root");
+        check!(!above(popup.0,root.0),"inactive popup remains above root");
         for g in &gpu {
-            assert!(!above(background.0,g.0),"inactive owner remains above GPU");
-            assert!(!above(popup.0,g.0),"inactive popup remains above GPU");
-            assert!(above(active.0,g.0)); assert!(above(ignored.0,g.0));
+            check!(!above(background.0,g.0),"inactive owner remains above GPU");
+            check!(!above(popup.0,g.0),"inactive popup remains above GPU");
+            check!(above(active.0,g.0),"active below GPU"); check!(above(ignored.0,g.0),"ignored below GPU");
         }
+        // Reported interaction: old normal app -> ignored app -> own settings
+        // -> ignored app. Ignored is still a real foreground anchor, not just
+        // an independently raised window. Reuse production anchor policy.
+        focus(background.0); pin_gpu(); focus(ignored.0);
+        let windows=[ignored.0,background.0,active.0].map(|h|crate::focus_policy::Window{id:h.0 as isize,monitor:1});
+        let (_,anchors)=crate::focus_policy::setup_anchors(&[(1,background.0.0 as isize)],&windows,
+            GetForegroundWindow().0 as isize,background.0.0 as isize,false);
+        assert_eq!(anchors,vec![(1,ignored.0.0 as isize)]);
+        for h in [background.0,popup.0,active.0] { app_place(h,root.0,true); }
+        focus(settings.0); pin_gpu(); focus(ignored.0);
+        for _ in 0..2 { pin_gpu(); pump(); }
+        dump("ignored-settings-return-settled",&named);
+        for h in [background.0,popup.0,active.0] {
+            check!(!above(h,root.0),"old normal app remains above root after ignored focus");
+            for g in &gpu { check!(!above(h,g.0),"old normal app remains above GPU after ignored focus"); }
+        }
+        assert_eq!(GetForegroundWindow(),ignored.0);
+        for g in &gpu { check!(above(ignored.0,g.0),"ignored below GPU after settings return"); }
         // The visual stack must not become an input target at the background.
-        assert_eq!(WindowFromPoint(POINT{x:120,y:320}),background.0);
+        check!(WindowFromPoint(POINT{x:120,y:320})==background.0,"visual input target changed");
+        }
+        println!("owner_mode={owner_mode} violations={violations:?}");
+        if owner_mode==3 { assert!(violations.is_empty(),"owner-preserving candidate did not satisfy ordering"); }
+        else if owner_mode==0 { assert!(!violations.is_empty(),"baseline owner coupling was not reproduced"); }
         }
     }
 }
