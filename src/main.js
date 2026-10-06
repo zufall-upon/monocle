@@ -368,3 +368,11 @@ setInterval(refreshForegroundApp, 250);
 
 init();
 refreshForegroundApp();
+
+document.getElementById("focus-diagnostics").addEventListener("click", async () => {
+  const output = document.getElementById("focus-diagnostics-output");
+  output.value = await invoke("get_focus_diagnostics");
+  output.hidden = false;
+  document.getElementById("focus-diagnostics-hint").hidden = false;
+  output.focus(); output.select();
+});

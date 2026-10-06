@@ -77,6 +77,11 @@ pub fn set_focus_rects(rects: &[(i32, i32, i32, i32)]) {
 }
 
 #[cfg(windows)]
+pub fn diagnostic_order(window: isize) -> String { imp::diagnostic_order(window) }
+#[cfg(not(windows))]
+pub fn diagnostic_order(_window: isize) -> String { String::new() }
+
+#[cfg(windows)]
 pub fn set_renderer_enabled(enabled: bool) { imp::set_renderer_enabled(enabled); }
 #[cfg(not(windows))]
 pub fn set_renderer_enabled(_enabled: bool) {}
@@ -276,6 +281,21 @@ mod imp {
         REVISION.fetch_add(1, Ordering::Release);
     }
 
+    pub fn diagnostic_order(window: isize) -> String {
+        let windows=WINDOWS.lock().unwrap().clone();
+        windows.iter().map(|&gpu| unsafe {
+            let mut current=HWND(window as *mut _);
+            let mut above=false;
+            for _ in 0..4096 {
+                let next=GetWindow(current,GW_HWNDNEXT).unwrap_or_default();
+                if next.0.is_null() { break; }
+                if next.0 as isize == gpu { above=true; break; }
+                current=next;
+            }
+            format!("{gpu:#x}:above={above}")
+        }).collect::<Vec<_>>().join(",")
+    }
+
     pub fn reassert_z(insert_after: isize) {
         if insert_after == 0 {
             return;
@@ -443,13 +463,10 @@ mod imp {
         // Click-through, no activation, not in Alt+Tab, true per-pixel alpha
         // (DComp). NOT topmost: the foreground app is raised above us.
         let hwnd = CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP
-                | WS_EX_TOOLWINDOW
-                | WS_EX_NOACTIVATE
-                | WS_EX_TRANSPARENT,
+            crate::input_policy::visual_ex_style(false),
             class_name,
             w!("DeepGpuBlur"),
-            WS_POPUP,
+            crate::input_policy::visual_style(),
             x,
             y,
             w,
@@ -1104,6 +1121,8 @@ mod imp {
     ) -> LRESULT {
         unsafe {
             match msg {
+                WM_NCHITTEST => LRESULT(HTTRANSPARENT as i32 as isize),
+                WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
                 WM_TIMER if wparam.0 == RENDER_TIMER => {
                     let stop = STOP.with(|s| s.borrow().as_ref()
                         .map(|s| s.load(Ordering::Acquire)).unwrap_or(false));

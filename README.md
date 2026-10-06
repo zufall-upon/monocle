@@ -3,28 +3,34 @@
 An experimental focus-overlay fork of [Deep / Monocle](https://github.com/brycelewiswork/monocle)
 by Bryce Lewis for Windows 10/11 x64. Upstream's MIT license is retained in [LICENSE](LICENSE).
 
-## Capture-free preview
+## Focus and desktop-input repair preview
 
-**Static mask is now the default**, including when upgrading old Deep Lite settings.
-Choose Solid, Stripes or Grid; Tint controls its color and opacity. This dims/masks
-background apps rather than blurring their pixels. Live blur is still selectable
-under Renderer, with previous blur preferences preserved.
+New settings default to **Live blur**. Existing explicit Renderer choices are
+preserved: if upgrading Preview 3, select **Renderer → Live blur** yourself.
+For one global sharp group use Per-monitor focus OFF and App-wide focus OFF;
+check Ignored apps for intentional exclusions. Defaults contain no ignored apps,
+and there are no Firefox/Tablacus-specific exclusions.
 
-Static mode creates no WGC sessions or D3D/Direct2D blur workers, performs no
-screen copies, Gaussian passes or swap-chain Presents, and allocates no grain
-bitmap. Windows caches the GDI overlay fill; settings/display changes repaint it
-and fades change its alpha. Focus tracking still runs; DWM still composites the
-windows. **GPU-zero and a measured speedup are not claimed.**
+All effect windows are now permanently noninteractive. Native clicks, drags,
+double-clicks and title-bar gestures pass to the real apps/desktop; the previous
+“first click only raises a blurred app” behavior has been removed. No synthetic
+mouse events, icon moves or desktop-window reparenting are used.
 
-Switching to Static tears down live GPU workers; disabling Live blur tears them
-down after fade-out. Switching back creates fresh resources for current monitors.
-The browser-focus repair reconciles stale window membership/z-order every 250 ms.
-Per-monitor focus intentionally keeps a sharp window on each monitor: turn it OFF
-for only one global focused group. App-wide focus and Ignored apps also expand
-what stays sharp. See [investigation and runtime checklist](docs/capture-free-options.md).
+Focusable tool windows now participate consistently in foreground tracking.
+Nonactivating/small popups can receive the background effect without becoming
+focus anchors. Separate windows sharing a hidden helper owner no longer become
+one sharp group with App-wide OFF. Desktop shell windows are not app anchors.
 
-Windows compilation and policy tests do not establish actual GPU/power savings,
-visual quality or real three-monitor behavior. Runtime validation remains pending.
+**Always-on-top windows are still outside the effect's non-topmost band.** We do
+not silently remove another app's topmost state or make the entire overlay always
+on top. This may require a separate design if it matches the reported symptom.
+Use **Show focus diagnostics** to inspect class, owner, styles, ignored status,
+exclusion reason and actual root/GPU z-order. Reports omit window titles/URLs.
+Firefox/Tablacus behavior has not been reproduced on the user's PC.
+
+Static mask (Solid/Stripes/Grid) remains optional. It dims without real blur and
+starts no WGC/D3D blur workers. DWM still composites either mode. No measured GPU
+saving or GPU-zero claim is made. [Focus/input investigation and runtime checklist](docs/focus-input-repair.md).
 
 ## Renderer revision 2
 
@@ -101,8 +107,8 @@ The binary is `src-tauri/target/release/deep-lite.exe`; the installer is under
 `src-tauri/target/release/bundle/nsis/`. Compilation does not launch the app.
 
 The manual [Windows workflow](.github/workflows/verify-windows.yml) checks the
-Windows code, requires at least 14 blur-policy, 7 isolation/settings, 6 focus and
-4 renderer-lifecycle tests, runs the
+Windows code, requires at least 14 blur-policy, 7 isolation/settings, 13 focus and
+4 renderer-lifecycle tests plus a native Win32 input-target fixture, runs the
 library tests, builds/packages the exe and installer, and records source SHA,
 Authenticode status and hashes. It uses a standard GitHub-hosted Windows runner
 in this public repository. Releases link the successful run for their exact SHA.

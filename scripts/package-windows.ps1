@@ -35,12 +35,13 @@ CI: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
 
 Compiled and packaged with the Tauri CLI on a standard GitHub-hosted Windows runner.
 Rust policy tests passed in this run; GPU/UI runtime was NOT exercised.
-Capture-free preview: Static mask defaults ON as the renderer selection.
-The app itself starts inactive. Renderer can be changed to Live blur in settings.
-Static uses Solid/Stripes/Grid GDI fills; it does NOT blur background pixels.
-Static creates no WGC/D3D blur workers. DWM still composites the overlay.
-Live retains revision 2 optimizations. This is NOT measured GPU savings.
-Focus lifecycle/z-order repair is included; Win32/browser behavior is untested.
+Focus/input repair preview: new settings default to Live blur; explicit prior
+renderer choices (including Static) are preserved. Choose Live blur in settings.
+Visual HWNDs are disabled/nonactivating/input-transparent. First-click absorption
+is removed; native app/desktop actions pass through. Tool-window classification
+and hidden-owner grouping are repaired. Topmost windows remain outside the effect.
+The native WindowFromPoint fixture does not establish real desktop gesture behavior.
+Actual Firefox/Tablacus, 3-monitor operation and GPU savings remain unverified.
 Operation counters: %TEMP%\deep-lite-gpu-blur.log (10-second cumulative samples).
 Fully occluded monitors are not automatically suspended.
 No code-signing certificate was supplied. Authenticode status:

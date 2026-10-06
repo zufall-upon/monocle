@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const BLUR_LAYERS: usize = 1;
 // Ownership chain (bottom to top):
-// [0]=transparent anchor, [1]=tint/input, [2]=grain
+// [0]=transparent anchor, [1]=tint, [2]=grain
 // Each window owns the next, so owned windows are always above owner.
 // Pushing behind [0] = behind the entire group.
 // Live desaturation is handled by the optional GPU renderer.
@@ -160,9 +160,7 @@ static OVERLAY_COLOR: Mutex<u32> = Mutex::new(0);
 // gesture. The polling timer re-arms the catcher once the cursor returns to a
 // client area — once WS_EX_TRANSPARENT is set, the catcher stops receiving
 // WM_MOUSEMOVE and only WM_TIMER can detect the move-back.
-static CATCHER_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
-const CATCHER_POLL_TIMER: usize = 1;
-const CATCHER_POLL_MS: u32 = 16;
+
 
 // Premultiplied-BGRA noise tile DC: the source pattern that's tiled across the
 // full-screen grain surface. Built once at init.
@@ -450,14 +448,7 @@ fn is_overlay(hwnd_val: isize) -> bool {
     ALL_HWNDS.lock().unwrap().contains(&hwnd_val)
 }
 
-/// Feed the GPU blur the focused app group's window rectangles (virtual-
-/// screen coords) so it can neutralize each window's footprint in the
-/// captured frame before blurring. Cross-process capture exclusion is
-/// OS-blocked (SetWindowDisplayAffinity returns ACCESS_DENIED on foreign
-/// windows), so instead the blur paints over the window region with its
-/// surrounding background — the crisp window never enters the blur input and
-/// can't smear into a halo around the raised foreground app. Dead and
-/// zero-area windows are skipped.
+/// Legacy focus-bound diagnostics; these rectangles do not cut holes in the GPU image.
 /// Per-hwnd smoothed rect: (hwnd, left, top, right, bottom) in f32.
 /// Vec (not HashMap) because `Mutex::new` needs a const initializer.
 #[cfg(windows)]
@@ -525,78 +516,48 @@ unsafe fn update_focus_rects(focused: &HashMap<isize, Vec<isize>>) {
 
 #[cfg(windows)]
 fn should_skip_window(hwnd: HWND) -> bool {
+    let traits = window_traits(hwnd);
+    traits.shell || traits.topmost || traits.own_process
+}
+
+#[cfg(windows)]
+fn window_traits(hwnd: HWND) -> crate::focus_policy::Traits {
     unsafe {
-        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        if ex_style & WS_EX_TOPMOST.0 != 0 { return true; }
-        let mut class_buf = [0u16; 256];
-        let len = GetClassNameW(hwnd, &mut class_buf);
-        if len == 0 { return false; }
-        let class = String::from_utf16_lossy(&class_buf[..len as usize]);
-        matches!(
-            class.as_str(),
-            "Shell_TrayWnd"
-                | "Shell_SecondaryTrayWnd"
-                // Win11 tray-overflow flyout panel
-                | "TopLevelWindowForOverflowXamlIsland"
-                // XAML popups (used by various Win10/11 system surfaces)
-                | "Xaml_WindowedPopupClass"
-                // Standard Win32 popup menu — used by TrackPopupMenu,
-                // which is what every tray icon's right-click menu sits
-                // on top of.
-                | "#32768"
-        )
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd,Some(&mut pid));
+        let style = GetWindowLongW(hwnd,GWL_EXSTYLE) as u32;
+        let mut buf=[0u16;256];
+        let len=GetClassNameW(hwnd,&mut buf).max(0) as usize;
+        let class=String::from_utf16_lossy(&buf[..len]);
+        let mut cloaked=0u32;
+        let _=DwmGetWindowAttribute(hwnd,DWMWA_CLOAKED,&mut cloaked as *mut _ as *mut _,4);
+        let mut rect=windows::Win32::Foundation::RECT::default();
+        let _=GetWindowRect(hwnd,&mut rect);
+        crate::focus_policy::Traits {
+            own_process: pid == std::process::id(),
+            shell: matches!(class.as_ref(),"Shell_TrayWnd"|"Shell_SecondaryTrayWnd"|"TopLevelWindowForOverflowXamlIsland"|"Xaml_WindowedPopupClass"|"#32768"|"Progman"|"WorkerW"),
+            visible:IsWindowVisible(hwnd).as_bool(), minimized:IsIconic(hwnd).as_bool(),
+            cloaked:cloaked!=0, topmost:style & WS_EX_TOPMOST.0 != 0,
+            no_activate:style & WS_EX_NOACTIVATE.0 != 0, tool:style & WS_EX_TOOLWINDOW.0 != 0,
+            width:rect.right-rect.left, height:rect.bottom-rect.top,
+        }
     }
 }
 
-/// Reject foreground windows that don't look like real app windows the
-/// user could be working in. Tray icon helpers — the hidden owner
-/// window that arbitrary apps SetForegroundWindow on before showing
-/// their right-click menu — fail this gate because they're invisible,
-/// cloaked, or zero-sized. Catches the case the same-PID and class
-/// filters miss: a foreign-process helper with an arbitrary class name.
 #[cfg(windows)]
 fn looks_like_real_app_window(hwnd: HWND) -> bool {
-    unsafe {
-        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() { return false; }
-        let mut cloaked: u32 = 0;
-        let _ = DwmGetWindowAttribute(
-            hwnd, DWMWA_CLOAKED,
-            &mut cloaked as *mut u32 as *mut _, 4,
-        );
-        if cloaked != 0 { return false; }
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() { return false; }
-        let w = rect.right - rect.left;
-        let h = rect.bottom - rect.top;
-        w >= 50 && h >= 50
-    }
+    crate::focus_policy::can_anchor(window_traits(hwnd))
 }
 
 #[cfg(windows)]
 fn is_eligible_window(hwnd: HWND, all_hwnds: &[isize]) -> bool {
-    unsafe {
-        let hwnd_val = hwnd.0 as isize;
-        if hwnd_val == 0 || all_hwnds.contains(&hwnd_val) { return false; }
-        // Our settings window is never part of focus mechanics — it floats
-        // above the overlay on its own (see SETTINGS_HWND handling in the
-        // tracker), so it must never be an anchor, group member, or demote
-        // target.
-        if hwnd_val == SETTINGS_HWND.load(Ordering::Relaxed) { return false; }
-        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() { return false; }
-        if should_skip_window(hwnd) { return false; }
-        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        if ex_style & WS_EX_TOOLWINDOW.0 != 0 { return false; }
-        let mut cloaked: u32 = 0;
-        let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut _, 4);
-        if cloaked != 0 { return false; }
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_ok() {
-            let w = rect.right - rect.left;
-            let h = rect.bottom - rect.top;
-            if w > 50 && h > 50 { return true; }
-        }
-        false
-    }
+    !hwnd.0.is_null() && !all_hwnds.contains(&(hwnd.0 as isize))
+        && crate::focus_policy::can_anchor(window_traits(hwnd))
+}
+
+#[cfg(windows)]
+fn is_effect_target(hwnd: HWND) -> bool {
+    !hwnd.0.is_null() && crate::focus_policy::receives_effect(window_traits(hwnd))
 }
 
 /// Whether a single window belongs to an ignored app (live exe lookup).
@@ -656,7 +617,7 @@ fn ignored_hwnds() -> Vec<isize> {
 unsafe fn push_below_overlay(target: HWND, root_overlay: HWND) {
     // Ignored apps are always sharp — never demote them, no matter which path
     // (focus change, monitor transfer) asked to.
-    if is_ignored_hwnd(target.0 as isize) {
+    if is_ignored_hwnd(target.0 as isize) || !is_effect_target(target) {
         return;
     }
     if let Err(error) = SetWindowPos(
@@ -682,15 +643,23 @@ unsafe fn push_below_overlay(target: HWND, root_overlay: HWND) {
 /// without changing any window's position relative to the others.
 #[cfg(windows)]
 fn enumerate_eligible_in_z_order(all_hwnds: &[isize]) -> Vec<isize> {
-    struct EnumState { all_hwnds: Vec<isize>, result: Vec<isize> }
+    enumerate_windows(all_hwnds,false)
+}
+#[cfg(windows)]
+fn enumerate_effect_targets(all_hwnds: &[isize]) -> Vec<isize> {
+    enumerate_windows(all_hwnds,true)
+}
+#[cfg(windows)]
+fn enumerate_windows(all_hwnds: &[isize], effects: bool) -> Vec<isize> {
+    struct EnumState { all_hwnds: Vec<isize>, result: Vec<isize>, effects: bool }
     unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let state = &mut *(lparam.0 as *mut EnumState);
-        if is_eligible_window(hwnd, &state.all_hwnds) {
+        if if state.effects { is_effect_target(hwnd) } else { is_eligible_window(hwnd, &state.all_hwnds) } {
             state.result.push(hwnd.0 as isize);
         }
         BOOL(1)
     }
-    let mut state = EnumState { all_hwnds: all_hwnds.to_vec(), result: Vec::new() };
+    let mut state = EnumState { all_hwnds: all_hwnds.to_vec(), result: Vec::new(), effects };
     unsafe { let _ = EnumWindows(Some(callback), LPARAM(&mut state as *mut EnumState as isize)); }
     state.result
 }
@@ -830,14 +799,55 @@ unsafe fn set_desktop_icons(show: bool) {
 /// an owned popup/dialog it returns its top-level owner.
 #[cfg(windows)]
 unsafe fn root_owner(hwnd: HWND) -> HWND {
-    let mut cur = hwnd;
-    loop {
-        match GetWindow(cur, GW_OWNER) {
-            Ok(o) if !o.0.is_null() => cur = o,
-            _ => return cur,
+    let mut chain=Vec::new();
+    let mut current=hwnd;
+    for _ in 0..64 {
+        let owner=GetWindow(current,GW_OWNER).unwrap_or_default();
+        if owner.0.is_null() { break; }
+        let t=window_traits(owner);
+        let usable=t.visible && !t.minimized && !t.cloaked && !t.shell && !t.own_process && t.width>0 && t.height>0;
+        chain.push((current.0 as isize,owner.0 as isize,usable));
+        if !usable || chain.iter().any(|(id,_,_)| *id==owner.0 as isize) { break; }
+        current=owner;
+    }
+    HWND(crate::focus_policy::visible_owner_root(hwnd.0 as isize,&chain) as *mut _)
+}
+
+#[cfg(windows)]
+fn focus_diagnostics() -> String {
+    unsafe {
+        let hwnds=ALL_HWNDS.lock().unwrap().clone();
+        let root=hwnds.first().copied().unwrap_or(0);
+        let mut out=format!("per_monitor={} app_wide={} static={} foreground={:#x} root={root:#x}\n",
+            OVERLAY_PER_MONITOR.load(Ordering::Relaxed),APP_WIDE_FOCUS.load(Ordering::Relaxed),
+            STATIC_MASK.load(Ordering::Relaxed),GetForegroundWindow().0 as isize);
+        unsafe extern "system" fn collect(hwnd: HWND,param: LPARAM)->BOOL {
+            if IsWindowVisible(hwnd).as_bool() {
+                (*(param.0 as *mut Vec<isize>)).push(hwnd.0 as isize);
+            }
+            BOOL(1)
         }
+        let mut windows:Vec<isize>=Vec::new();
+        let _=EnumWindows(Some(collect),LPARAM(&mut windows as *mut _ as isize));
+        for (rank,id) in windows.into_iter().enumerate() {
+            let hwnd=HWND(id as *mut _);
+            let t=window_traits(hwnd);
+            let mut cls=[0u16;256];let n=GetClassNameW(hwnd,&mut cls).max(0) as usize;
+            let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
+            let owner=GetWindow(hwnd,GW_OWNER).unwrap_or_default().0 as isize;
+            out.push_str(&format!("rank={rank} hwnd={id:#x} pid={pid} exe={} class={} owner={owner:#x} family={:#x} tool={} noactivate={} topmost={} anchor={} ignored={} exclusion={:?} above_root={} gpu={}\n",
+                crate::windows_api::exe_name_for_hwnd(id).unwrap_or_default(),String::from_utf16_lossy(&cls[..n]),root_owner(hwnd).0 as isize,
+                t.tool,t.no_activate,t.topmost,crate::focus_policy::can_anchor(t),is_ignored_hwnd(id),
+                crate::focus_policy::exclusion(t),root!=0 && is_above_overlay(hwnd,HWND(root as *mut _)),
+                crate::gpu_blur::diagnostic_order(id)));
+        }
+        out
     }
 }
+#[cfg(windows)]
+pub fn diagnostic_snapshot() -> String { focus_diagnostics() }
+#[cfg(not(windows))]
+pub fn diagnostic_snapshot() -> String { "Windows-only diagnostics".into() }
 
 /// Short window label for the diagnostic log: `0x1234 "Title" [exe]`.
 #[cfg(windows)]
@@ -889,7 +899,7 @@ fn fg_app_group(fg: HWND, all_hwnds: &[isize]) -> Vec<isize> {
     unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let state = &mut *(lparam.0 as *mut EnumState);
         let val = hwnd.0 as isize;
-        if state.all_hwnds.contains(&val) { return BOOL(1); }
+        if state.all_hwnds.contains(&val) || window_traits(hwnd).own_process { return BOOL(1); }
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() { return BOOL(1); }
         let mut cloaked: u32 = 0;
         let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut _, 4);
@@ -1002,7 +1012,7 @@ unsafe fn reconcile_focus(groups: &mut HashMap<isize,Vec<isize>>, hwnds: &[isize
     let sharp: Vec<_> = groups.values().flatten().copied().collect();
     let root = HWND(hwnds[0] as *mut _);
     // Reassert only actual violations, not the entire desktop every tracker tick.
-    for &id in &ordered {
+    for id in enumerate_effect_targets(hwnds) {
         let hwnd = HWND(id as *mut _);
         let above = is_above_overlay(hwnd,root);
         if crate::focus_policy::must_lower(id,&sharp,ignored,above) {
@@ -1013,87 +1023,6 @@ unsafe fn reconcile_focus(groups: &mut HashMap<isize,Vec<isize>>, hwnds: &[isize
             let _ = SetWindowPos(hwnd,Some(insert_after),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         }
     }
-}
-
-/// Find the topmost eligible window underneath the overlay at a screen
-/// point. Used when grain catches a click — figures out which background
-/// app the user meant to raise.
-#[cfg(windows)]
-fn find_window_at_point(pt: windows::Win32::Foundation::POINT, all_hwnds: &[isize]) -> Option<HWND> {
-    struct EnumState {
-        all_hwnds: Vec<isize>,
-        pt: windows::Win32::Foundation::POINT,
-        result: Option<HWND>,
-    }
-    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let state = &mut *(lparam.0 as *mut EnumState);
-        if state.result.is_some() { return BOOL(0); }
-        if !is_eligible_window(hwnd, &state.all_hwnds) { return BOOL(1); }
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_ok()
-            && state.pt.x >= rect.left && state.pt.x < rect.right
-            && state.pt.y >= rect.top && state.pt.y < rect.bottom
-        {
-            state.result = Some(hwnd);
-            return BOOL(0);
-        }
-        BOOL(1)
-    }
-    let mut state = EnumState { all_hwnds: all_hwnds.to_vec(), pt, result: None };
-    unsafe { let _ = EnumWindows(Some(callback), LPARAM(&mut state as *mut EnumState as isize)); }
-    state.result
-}
-
-/// Toggle WS_EX_TRANSPARENT on the input-catcher layer (tint). When on,
-/// hit-testing passes the cursor (and clicks) through to the window underneath.
-#[cfg(windows)]
-fn set_catcher_passthrough_style(catcher_hwnd: HWND, on: bool) {
-    unsafe {
-        let cur = GetWindowLongW(catcher_hwnd, GWL_EXSTYLE) as u32;
-        let new = if on {
-            cur | WS_EX_TRANSPARENT.0
-        } else {
-            cur & !WS_EX_TRANSPARENT.0
-        };
-        if new != cur {
-            SetWindowLongW(catcher_hwnd, GWL_EXSTYLE, new as i32);
-        }
-    }
-    CATCHER_PASSTHROUGH.store(on, Ordering::Relaxed);
-}
-
-/// Does the cursor want grain to be click-through? True if the window
-/// underneath the overlay reports a non-client hit (title bar, caption
-/// buttons, resize edges) — those should respond to one continuous
-/// gesture, not be absorbed.
-#[cfg(windows)]
-fn cursor_wants_passthrough(pt: windows::Win32::Foundation::POINT, all_hwnds: &[isize]) -> bool {
-    let target = match find_window_at_point(pt, all_hwnds) {
-        Some(h) => h,
-        None => return false,
-    };
-    let lo = (pt.x as u32) & 0xFFFF;
-    let hi = (pt.y as u32) & 0xFFFF;
-    let lparam_xy = ((hi << 16) | lo) as isize;
-    let mut hit: usize = 0;
-    unsafe {
-        SendMessageTimeoutW(
-            target,
-            WM_NCHITTEST,
-            WPARAM(0),
-            LPARAM(lparam_xy),
-            SMTO_ABORTIFHUNG,
-            50,
-            Some(&mut hit as *mut _),
-        );
-    }
-    matches!(
-        hit as u32,
-        HTCAPTION | HTSYSMENU | HTMINBUTTON | HTMAXBUTTON | HTCLOSE | HTHELP
-            | HTLEFT | HTRIGHT | HTTOP | HTBOTTOM
-            | HTTOPLEFT | HTTOPRIGHT | HTBOTTOMLEFT | HTBOTTOMRIGHT
-            | HTBORDER
-    )
 }
 
 /// Find the top eligible window on a specific monitor (by z-order).
@@ -1120,24 +1049,18 @@ fn find_top_window_on_monitor(target_mon: isize, all_hwnds: &[isize]) -> Option<
 
 const BLUR_LAYER_GRADIENT: u32 = 0x01FFFFFF;
 
-/// Layout: anchor, tint/input, grain (ownership chain, bottom to top)
+/// Layout: anchor, tint, grain (ownership chain, bottom to top)
 #[cfg(windows)]
 unsafe fn apply_all(all_hwnds: &[isize], vis: &OverlayVisuals, fade: f64) {
     let tint_hwnd = HWND(all_hwnds[TINT_IDX] as *mut _);
     let grain_hwnd = HWND(all_hwnds[GRAIN_IDX] as *mut _);
 
-    // --- Tint/input window ---
-    // The tint color is now an HSL "Color" blend folded into the GPU blur
-    // pipeline (see gpu_blur::set_tint), so this window contributes nothing
-    // visually. But it still doubles as the input catcher (no
-    // WS_EX_TRANSPARENT). Per MSDN, hit-testing on an LWA_ALPHA window uses
-    // its alpha: alpha=0 lets clicks pass straight through. Hold a 1/255
-    // floor while the overlay is visible so we always intercept clicks (the
-    // GPU does the real colorize, so this alpha is imperceptible).
+    // Visual opacity is independent of hit testing. Live tint is in the GPU
+    // image; the GDI tint is transparent in Live mode and never catches input.
     let mask = STATIC_MASK.load(Ordering::Relaxed);
     let catcher_alpha = if fade <= 0.0 { 0 } else if mask {
         (vis.tint_opacity * fade * 255.0).clamp(1.0,255.0) as u8
-    } else { 1 };
+    } else { 0 };
     SetLayeredWindowAttributes(
         tint_hwnd, windows::Win32::Foundation::COLORREF(0), catcher_alpha, LWA_ALPHA,
     ).ok();
@@ -1232,20 +1155,12 @@ pub fn init() {
                 } else {
                     Some(HWND(hwnds[i - 1] as *mut _))
                 };
-                // The tint layer catches mouse input so we can force the
-                // cursor to an arrow and absorb stray clicks on blurred
-                // background apps. Grain sits above it but is click-through
-                // (its per-pixel ULW surface plus WS_EX_TRANSPARENT pass every
-                // click down to tint). All other layers stay click-through too.
-                let ex_style = if i == TINT_IDX {
-                    WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-                } else {
-                    WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-                };
+                // All visual layers are permanently input-transparent and disabled.
+                let ex_style = crate::input_policy::visual_ex_style(true);
                 let hwnd = CreateWindowExW(
                     ex_style,
                     class_name, windows::core::w!("DeepOverlay"),
-                    WS_POPUP, sx, sy, sw, sh,
+                    crate::input_policy::visual_style(), sx, sy, sw, sh,
                     owner, None, Some(hinstance.into()), None,
                 ).expect("Failed to create overlay window");
                 // Grain is driven exclusively by UpdateLayeredWindow; calling
@@ -1602,7 +1517,7 @@ fn foreground_tracker() {
                 {
                     let mut pushed = PUSHED_DOWN.lock().unwrap();
                     let mut prev_below = root_overlay;
-                    for &w in &z_ordered {
+                    for w in enumerate_effect_targets(&hwnds) {
                         if sharp_set.contains(&w) { continue; }
                         let hw = HWND(w as *mut _);
                         let _ = SetWindowPos(
@@ -1867,83 +1782,13 @@ fn foreground_tracker() {
     }
 }
 
-/// [10]=tint (solid color + input catcher), [11]=grain (ULW noise),
+/// Tint (solid/hatch fill), grain (ULW noise),
 /// [0..9]=blur (no paint).
 #[cfg(windows)]
 unsafe extern "system" fn overlay_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // Tint doubles as the input catcher for the entire overlay group.
-    // Force the arrow cursor, refuse activation, and translate clicks
-    // into focus-only "raise window" actions on the app underneath.
-    let is_catcher = {
-        let hwnds = ALL_HWNDS.lock().unwrap();
-        hwnds.get(TINT_IDX) == Some(&(hwnd.0 as isize))
-    };
-    if is_catcher {
-        match msg {
-            WM_SETCURSOR => {
-                if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
-                    SetCursor(Some(arrow));
-                }
-                return LRESULT(1);
-            }
-            WM_MOUSEACTIVATE => {
-                return LRESULT(MA_NOACTIVATE as isize);
-            }
-            WM_MOUSEMOVE => {
-                let mut pt = windows::Win32::Foundation::POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                let snapshot: Vec<isize> = ALL_HWNDS.lock().unwrap().clone();
-                if cursor_wants_passthrough(pt, &snapshot)
-                    && !CATCHER_PASSTHROUGH.load(Ordering::Relaxed)
-                {
-                    set_catcher_passthrough_style(hwnd, true);
-                    SetTimer(Some(hwnd), CATCHER_POLL_TIMER, CATCHER_POLL_MS, None);
-                }
-                return LRESULT(0);
-            }
-            WM_TIMER => {
-                if wparam.0 == CATCHER_POLL_TIMER {
-                    if !IsWindowVisible(hwnd).as_bool() {
-                        let _ = KillTimer(Some(hwnd), CATCHER_POLL_TIMER);
-                        set_catcher_passthrough_style(hwnd, false);
-                        return LRESULT(0);
-                    }
-                    let mut pt = windows::Win32::Foundation::POINT::default();
-                    let _ = GetCursorPos(&mut pt);
-                    let snapshot: Vec<isize> = ALL_HWNDS.lock().unwrap().clone();
-                    if !cursor_wants_passthrough(pt, &snapshot) {
-                        let _ = KillTimer(Some(hwnd), CATCHER_POLL_TIMER);
-                        set_catcher_passthrough_style(hwnd, false);
-                    }
-                }
-                return LRESULT(0);
-            }
-            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN
-            | WM_XBUTTONDOWN => {
-                let mut pt = windows::Win32::Foundation::POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                let snapshot: Vec<isize> = ALL_HWNDS.lock().unwrap().clone();
-                if let Some(target) = find_window_at_point(pt, &snapshot) {
-                    // BringWindowToTop raises within the z-order;
-                    // SetForegroundWindow activates. We deliberately do NOT
-                    // call SwitchToThisWindow here — its alt-tab semantics
-                    // shove unrelated windows (including the other monitor's
-                    // focused app) backward, which is the exact cross-
-                    // monitor stranding the tracker then has to undo.
-                    let _ = BringWindowToTop(target);
-                    let _ = SetForegroundWindow(target);
-                }
-                return LRESULT(0);
-            }
-            WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP
-            | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK | WM_XBUTTONDBLCLK => {
-                return LRESULT(0);
-            }
-            _ => {}
-        }
-    }
-
     match msg {
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as i32 as isize),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_DISPLAYCHANGE => {
             // Never wait for animation/GDI locks in the UI thread: the tracker
             // can hold them while making synchronous Win32 window calls.

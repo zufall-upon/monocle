@@ -38,10 +38,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $isolationTests = @($allTests | Select-String '^(identity::tests|settings::tests|windows_api::tests|isolation_tests)::.+: test$')
           if ($isolationTests.Count -lt 7) { throw "Expected at least 7 isolation/settings tests." }
-          $focusTests = @($allTests | Select-String '^focus_policy::tests::.+: test$')
-          if ($focusTests.Count -lt 6) { throw "Expected at least 6 focus reconciliation tests." }
+          $focusTests = @($allTests | Select-String '^focus_policy::(tests|classification_tests)::.+: test$')
+          if ($focusTests.Count -lt 13) { throw "Expected at least 13 focus classification/reconciliation tests." }
           $rendererTests = @($allTests | Select-String '^renderer_policy::tests::.+: test$')
           if ($rendererTests.Count -lt 4) { throw "Expected at least 4 renderer lifecycle tests." }
+          $inputTests = @($allTests | Select-String '^input_policy::tests::.+: test$')
+          if ($inputTests.Count -lt 1) { throw "Expected Win32 visual input fixture." }
           cargo test --locked --lib
       - name: Build Windows executable and NSIS installer
         run: npm run build -- --ci --bundles nsis -- --locked

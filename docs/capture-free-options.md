@@ -1,5 +1,7 @@
 # Capture-free direction and focus investigation
 
+Historical Preview 3 notes. The next preview restores Live as the missing-field default, preserves explicit choices and repairs input/focus; see [current notes](focus-input-repair.md).
+
 The user reports both GPU previews remain too heavy. Whole-adapter screenshots (51%, then 90% on GPU0, different GPU1 values) establish neither equivalent conditions nor Deep Lite's share of that work. The usability report is still a failure of the performance goal. This document compares a different approach; it does not claim another measured speedup.
 
 ## What PrivacyScreen actually does

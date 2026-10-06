@@ -46,6 +46,11 @@
 
     <div class="controls">
       <div class="control-group">
+        <button id="focus-diagnostics">Show focus diagnostics</button>
+        <textarea id="focus-diagnostics-output" readonly hidden rows="8" style="width:100%;user-select:text" aria-label="Focus diagnostics"></textarea>
+        <p id="focus-diagnostics-hint" hidden style="font-size:12px">Select and copy this report if focus is wrong. It includes executable/class names, but no window titles.</p>
+      </div>
+      <div class="control-group">
         <label for="effect-renderer">Renderer</label>
         <select id="effect-renderer">
           <option value="mask">Static mask (no capture)</option>

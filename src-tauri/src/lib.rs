@@ -1,3 +1,5 @@
+#[cfg(windows)]
+mod input_policy;
 mod renderer_policy;
 mod focus_policy;
 #[cfg(any(windows, test))]
@@ -30,6 +32,9 @@ pub struct AppState {
     // before rebinding when any shortcut setting changes.
     pub shortcuts: Arc<Mutex<Vec<Shortcut>>>,
 }
+
+#[tauri::command]
+fn get_focus_diagnostics() -> String { overlay::diagnostic_snapshot() }
 
 #[tauri::command]
 fn get_settings(state: tauri::State<AppState>) -> AppSettings {
@@ -418,10 +423,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Initialize overlay system. The grain layer doubles as an
-            // input catcher: it absorbs the first "raise" click on
-            // blurred background windows and forces an arrow cursor over
-            // them, so accidental UI hits behind the blur don't fire.
+            // Visual windows never intercept input; Windows handles native clicks.
             overlay::init();
 
             // The retired Magnification path is not initialized. Desaturation
@@ -466,7 +468,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(tauri::generate_handler![get_focus_diagnostics,
             get_settings,
             update_settings,
             toggle_active,
