@@ -1,5 +1,7 @@
 #[cfg(windows)]
 mod input_policy;
+#[cfg(all(windows, test))]
+mod z_order_fixture;
 mod renderer_policy;
 mod focus_policy;
 #[cfg(any(windows, test))]
