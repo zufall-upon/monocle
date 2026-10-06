@@ -1,7 +1,7 @@
 > **Experimental low-GPU fork:** Background blur updates are budgeted to 20/s,
-> with capture suspension while disabled and cached-frame reuse. Blur remains
-> enabled and full resolution. Windows runtime behavior and GPU savings have not
-> yet been measured. See [implementation and validation status](docs/low-gpu-blur.md).
+> with capture suspension while disabled and cached-frame reuse. Strong Deep
+> blur uses half-size effect bitmaps; weak Deep blur and Ambient retain the native
+> path. Windows runtime behavior and GPU savings have not yet been measured. See [implementation and validation status](docs/low-gpu-blur.md).
 > The Install links below are upstream releases, not binaries from this fork.
 
 <div align="center">

@@ -20,9 +20,16 @@ jobs:
       - name: Check Windows code
         working-directory: src-tauri
         run: cargo check --locked
-      - name: Run Rust tests
+      - name: Require policy tests and run library tests
         working-directory: src-tauri
-        run: cargo test --locked --lib
+        shell: pwsh
+        run: |
+          $listedTests = cargo test --locked --lib blur_policy::tests -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $listedTests | Write-Output
+          $policyTests = @($listedTests | Select-String '^blur_policy::tests::.+: test$')
+          if ($policyTests.Count -lt 10) { throw "Expected at least 10 blur policy tests; refusing an empty or incomplete suite." }
+          cargo test --locked --lib
       - name: Build Windows executable without installer
         working-directory: src-tauri
         run: cargo build --locked --release

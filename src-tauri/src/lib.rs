@@ -1,3 +1,5 @@
+#[cfg(any(windows, test))]
+mod blur_policy;
 mod gpu_blur;
 mod logging;
 mod magnifier;

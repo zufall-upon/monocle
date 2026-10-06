@@ -47,9 +47,8 @@ pub fn set_fade(progress: f64) {
     imp::set_fade(progress);
 }
 
-/// Tint applied to the blurred background as a Direct2D HSL "Color" blend:
-/// the background keeps its luminance (light/dark detail) but takes the
-/// hue + saturation of `(r, g, b)`. `strength` (0..=1) crossfades between
+/// Tint uses the existing Direct2D DISSOLVE blend (a per-pixel color wash).
+/// `strength` (0..=1) crossfades between
 /// the untinted and fully-colorized result. r/g/b are 0..=1. Called from
 /// `update_overlay` whenever settings change.
 #[cfg(windows)]
@@ -100,6 +99,7 @@ pub fn set_focus_rects(_rects: &[(i32, i32, i32, i32)]) {}
 
 #[cfg(windows)]
 mod imp {
+    use crate::blur_policy::{half_deep_plan, CaptureDemand, Extent, HalfDeepPlan, SessionAction, UpdateState};
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -110,11 +110,11 @@ mod imp {
     };
     use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
     use windows::Graphics::DirectX::DirectXPixelFormat;
-    use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{E_INVALIDARG, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BLEND_MODE_DISSOLVE,
         D2D1_BORDER_MODE_HARD, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_GRADIENT_STOP,
-        D2D1_PIXEL_FORMAT, D2D_RECT_F,
+        D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
     };
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, ID2D1Bitmap1, ID2D1Brush, ID2D1DeviceContext, ID2D1Effect,
@@ -179,7 +179,7 @@ mod imp {
     // treatments and crossfade between them.
     static MODE_MIX_BITS: AtomicU64 = AtomicU64::new(0);
     // Tint color (f32 bits, 0..1 per channel) and blend strength (f32 bits,
-    // 0..1). Applied as an HSL "Color" blend over the (de)saturated source —
+    // 0..1). Applied as a DISSOLVE blend over the (de)saturated source —
     // see draw(). Strength 0 = untinted; 1 = fully colorized.
     static TINT_R_BITS: AtomicU32 = AtomicU32::new(0);
     static TINT_G_BITS: AtomicU32 = AtomicU32::new(0);
@@ -336,7 +336,7 @@ mod imp {
         _dcomp: IDCompositionDevice,
         saturation: ID2D1Effect,
         gaussian: ID2D1Effect,
-        // Tint chain: flood (solid tint color) -> blend (HSL Color over the
+        // Tint chain: flood (solid tint color) -> blend (DISSOLVE over the
         // saturated source) -> crossfade (mix untinted<->colorized by
         // strength). Output feeds the blur, so the whole background is tinted
         // uniformly across both deep-focus and ambient treatments.
@@ -355,10 +355,11 @@ mod imp {
         // focus rects (which arrive in virtual coords) into local pixels.
         origin_x: i32,
         origin_y: i32,
-        has_frame: Cell<bool>,
+        updates: RefCell<UpdateState>,
+        half_deep: RefCell<Option<HalfDeepSurfaces>>,
+        half_deep_unavailable: Cell<bool>,
         item: GraphicsCaptureItem,
         session: RefCell<Option<GraphicsCaptureSession>>,
-        revision: Cell<u64>,
         _d3d: ID3D11Device,
         _d3d_device: IDirect3DDevice,
         _target: IDCompositionTarget,
@@ -666,10 +667,11 @@ mod imp {
                 cap_bmp,
                 origin_x,
                 origin_y,
-                has_frame: Cell::new(false),
+                updates: RefCell::new(UpdateState::new(Extent { width, height })),
+                half_deep: RefCell::new(None),
+                half_deep_unavailable: Cell::new(false),
                 item,
                 session: RefCell::new(None),
-                revision: Cell::new(0),
                 _d3d: d3d,
                 _d3d_device: d3d_device,
                 _target: target,
@@ -697,21 +699,22 @@ mod imp {
     unsafe fn draw(hwnd: HWND, rs: &Render) -> windows::core::Result<()> {
         let ctx = &rs.ctx;
         let revision = REVISION.load(Ordering::Acquire);
-        let dirty = revision != rs.revision.get();
-        if !wants_capture() {
+        let wanted = wants_capture();
+        let action = rs.updates.borrow_mut().set_capture(wanted);
+        if !wanted {
             sync_visibility(hwnd, rs);
             if let Some(session) = rs.session.borrow_mut().take() {
                 session.Close()?;
-                while let Ok(frame) = rs.framepool.TryGetNextFrame() {
-                    let _ = frame.Close();
+                for _ in 0..2 {
+                    if let Ok(frame) = rs.framepool.TryGetNextFrame() {
+                        let _ = frame.Close();
+                    } else { break; }
                 }
-                rs.has_frame.set(false);
             }
-            rs.revision.set(revision);
             return Ok(());
         }
 
-        if rs.session.borrow().is_none() {
+        if action == SessionAction::Start {
             let session = rs.framepool.CreateCaptureSession(&rs.item)?;
             let _ = session.SetIsCursorCaptureEnabled(false);
             let _ = session.SetIsBorderRequired(false);
@@ -744,35 +747,32 @@ mod imp {
                 }
             }
         }
-        let mut got = false;
         if let Some(frame) = newest {
             // Always release the checked-out frame, including on COM failures.
-            let result = (|| -> windows::core::Result<bool> {
+            let result = (|| -> windows::core::Result<()> {
                 let size = frame.ContentSize()?;
-                if size.Width != rs.width as i32 || size.Height != rs.height as i32 {
-                    return Ok(false); // topology reconciliation will rebuild
-                }
                 let surface = frame.Surface()?;
                 let access = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
                 let src_tex = access.GetInterface::<ID3D11Texture2D>()?;
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 src_tex.GetDesc(&mut desc);
-                if desc.Width != rs.width || desc.Height != rs.height {
-                    return Ok(false);
+                let accepted = rs.updates.borrow_mut().accept_frame(
+                    Extent { width: size.Width as u32, height: size.Height as u32 },
+                    Extent { width: desc.Width, height: desc.Height },
+                );
+                if !accepted {
+                    return Err(windows::core::Error::from_hresult(E_INVALIDARG));
                 }
                 rs.d3d_ctx.CopyResource(&rs.cap_tex, &src_tex);
-                Ok(true)
+                Ok(())
             })();
             let _ = frame.Close();
-            got = result?;
-        }
-        if got {
-            rs.has_frame.set(true);
+            result?;
         }
         // Reuse the existing swapchain image on a static desktop. Settings,
         // fade and mode changes can redraw the cached capture without waiting
         // for another WGC frame.
-        if !rs.has_frame.get() || (!got && !dirty) {
+        if !rs.updates.borrow().needs_draw(revision) {
             return Ok(());
         }
 
@@ -790,23 +790,13 @@ mod imp {
             colorContext: std::mem::ManuallyDrop::new(None),
         };
         let target_bitmap: ID2D1Bitmap1 = ctx.CreateBitmapFromDxgiSurface(&back, Some(&props))?;
-        ctx.SetTarget(&target_bitmap);
-
-        ctx.BeginDraw();
-        ctx.Clear(Some(&D2D1_COLOR_F {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.0,
-        }));
-
         let w = rs.width as f32;
         let h = rs.height as f32;
 
         // Only paint blur while there's something to show. When fully faded
         // out we present a transparent frame (clears the last image) and let
         // the sync handler hide the window.
-        if rs.has_frame.get() && fade > 0.0 {
+        if fade > 0.0 {
             let stddev = stddev();
             let desaturate = DESATURATE.load(Ordering::Relaxed);
 
@@ -854,6 +844,14 @@ mod imp {
             let mix = mode_mix();
             let show_deep = mix < 0.999;
             let show_ambient = mix > 0.001;
+            let half_plan = half_deep_plan(Extent { width: rs.width, height: rs.height }, stddev, mix);
+            let half_bitmap = if let Some(plan) = half_plan {
+                render_half_deep(rs, &src, plan)?
+            } else { None };
+
+            ctx.SetTarget(&target_bitmap);
+            ctx.BeginDraw();
+            ctx.Clear(Some(&transparent()));
 
             // --- Deep focus: uniform full-screen blur (drawn first, beneath
             // the ambient stack). Opacity = fade. During a transition the
@@ -861,10 +859,6 @@ mod imp {
             // both treatments are full blur, so the still-opaque deep layer
             // never reads as a double image.
             if show_deep {
-                rs.gaussian.SetInput(0, &src, true);
-                set_blur(&rs.gaussian, stddev);
-                let output = rs.gaussian.GetOutput()?;
-
                 let faded = fade < 0.999;
                 if faded {
                     let layer = D2D1_LAYER_PARAMETERS1 {
@@ -878,13 +872,20 @@ mod imp {
                     };
                     ctx.PushLayer(&layer, None);
                 }
-                ctx.DrawImage(
-                    &output,
-                    None,
-                    Some(&source_rect),
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                );
+                if let Some(bitmap) = half_bitmap.as_ref() {
+                    // A materialized small bitmap, not a live Gaussian graph:
+                    // upscaling cannot cause the blur to evaluate at native size.
+                    ctx.DrawBitmap(bitmap, Some(&source_rect), 1.0,
+                        D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                } else {
+                    rs.gaussian.SetInput(0, &src, true);
+                    set_blur(&rs.gaussian, stddev);
+                    let output = rs.gaussian.GetOutput()?;
+                    ctx.DrawImage(
+                        &output, None, Some(&source_rect),
+                        D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                    );
+                }
                 if faded {
                     ctx.PopLayer();
                 }
@@ -957,13 +958,107 @@ mod imp {
                     ctx.PopLayer();
                 }
             }
+        } else {
+            ctx.SetTarget(&target_bitmap);
+            ctx.BeginDraw();
+            ctx.Clear(Some(&transparent()));
         }
 
         ctx.EndDraw(None, None)?;
         rs.swapchain.Present(0, Default::default()).ok()?;
-        rs.revision.set(revision);
+        rs.updates.borrow_mut().presented(revision);
         sync_visibility(hwnd, rs);
         Ok(())
+    }
+
+    struct HalfDeepSurfaces {
+        // Materialize tint at native 96-DPI resolution before scaling. Moving
+        // DISSOLVE itself to the half-size target would double its grain size.
+        tinted_native: ID2D1Bitmap1,
+        input: ID2D1Bitmap1,
+        blurred: ID2D1Bitmap1,
+    }
+
+    unsafe fn effect_bitmap(ctx: &ID2D1DeviceContext, extent: Extent) -> windows::core::Result<ID2D1Bitmap1> {
+        ctx.CreateBitmap(
+            D2D_SIZE_U { width: extent.width, height: extent.height }, None, 0,
+            &D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                // TARGET without CANNOT_DRAW: read in a later, separate pass.
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                colorContext: std::mem::ManuallyDrop::new(None),
+            },
+        )
+    }
+
+    unsafe fn render_half_deep(rs: &Render, source: &ID2D1Image, plan: HalfDeepPlan)
+        -> windows::core::Result<Option<ID2D1Bitmap1>>
+    {
+        if rs.half_deep_unavailable.get() { return Ok(None); }
+        let ctx = &rs.ctx;
+        let mut storage = rs.half_deep.borrow_mut();
+        if storage.is_none() {
+            let allocate = (|| -> windows::core::Result<HalfDeepSurfaces> {
+                Ok(HalfDeepSurfaces {
+                    tinted_native: effect_bitmap(ctx, Extent { width: rs.width, height: rs.height })?,
+                    input: effect_bitmap(ctx, plan.extent)?,
+                    blurred: effect_bitmap(ctx, plan.extent)?,
+                })
+            })();
+            match allocate {
+                Ok(surfaces) => *storage = Some(surfaces),
+                Err(e) => {
+                    // Allocation is optional. Keep working at native resolution
+                    // and avoid retrying every frame until the worker is rebuilt.
+                    rs.half_deep_unavailable.set(true);
+                    log(&format!("half-size Deep allocation failed; using native blur: {e:?}"));
+                    return Ok(None);
+                }
+            }
+        }
+        let surfaces = storage.as_ref().unwrap();
+        let native_rect = D2D_RECT_F {
+            left: 0.0, top: 0.0, right: rs.width as f32, bottom: rs.height as f32,
+        };
+        let half_rect = D2D_RECT_F {
+            left: 0.0, top: 0.0,
+            right: plan.extent.width as f32, bottom: plan.extent.height as f32,
+        };
+        // All three passes use physical pixels (96 DPI) and identity transform.
+        // No effect or bitmap is ever sampled while it is the current target.
+        ctx.SetTarget(&surfaces.tinted_native);
+        ctx.BeginDraw();
+        ctx.Clear(Some(&transparent()));
+        ctx.DrawImage(source, None, Some(&native_rect),
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+        ctx.EndDraw(None, None)?;
+
+        ctx.SetTarget(&surfaces.input);
+        ctx.BeginDraw();
+        ctx.Clear(Some(&transparent()));
+        ctx.DrawBitmap(&surfaces.tinted_native, Some(&half_rect), 1.0,
+            D2D1_INTERPOLATION_MODE_LINEAR, Some(&native_rect), None);
+        ctx.EndDraw(None, None)?;
+
+        rs.gaussian.SetInput(0, &surfaces.input, true);
+        set_blur(&rs.gaussian, plan.stddev);
+        let output = rs.gaussian.GetOutput()?;
+        ctx.SetTarget(&surfaces.blurred);
+        ctx.BeginDraw();
+        ctx.Clear(Some(&transparent()));
+        ctx.DrawImage(&output, None, Some(&half_rect),
+            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+        ctx.EndDraw(None, None)?;
+        Ok(Some(surfaces.blurred.clone()))
+    }
+
+    fn transparent() -> D2D1_COLOR_F {
+        D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
     }
 
     unsafe fn set_blur(gaussian: &ID2D1Effect, stddev: f32) {
@@ -1023,14 +1118,19 @@ mod imp {
     // show state to match. Visible whenever the overlay is active or still
     // fading out.
     fn wants_capture() -> bool {
-        (ACTIVE.load(Ordering::Relaxed) || fade() > 0.0)
-            && (stddev() > 0.0 || DESATURATE.load(Ordering::Relaxed) || tint_strength() > 0.001)
+        CaptureDemand {
+            active: ACTIVE.load(Ordering::Relaxed),
+            fade: fade(),
+            stddev: stddev(),
+            desaturate: DESATURATE.load(Ordering::Relaxed),
+            tint_strength: tint_strength(),
+        }.wanted()
     }
 
     unsafe fn sync_visibility(hwnd: HWND, rs: &Render) {
         // Never show a stale pre-suspension backbuffer before the first fresh
         // frame has been presented. With every effect off the GPU layer is idle.
-        let want = wants_capture() && fade() > 0.0 && rs.has_frame.get();
+        let want = wants_capture() && fade() > 0.0 && rs.updates.borrow().has_frame();
         let was = rs.shown.get();
         if want && !was {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
